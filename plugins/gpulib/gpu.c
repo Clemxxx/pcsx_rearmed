@@ -1283,6 +1283,12 @@ void GPUrearmedCallbacks(const struct rearmed_cbs *cbs)
   renderer_set_config(cbs);
   vout_set_config(cbs);
   gpu_dump_config(cbs);
+#ifdef GPULIB_DUMP_RECORDER
+  /* deterministic recordings: interlaced rendering depends on field
+   * state that is not part of the command stream */
+  if (getenv("PSXGPU_DUMP"))
+    gpu.state.allow_interlace = 0;
+#endif
 
   gpu_async_enable(&gpu, cbs->thread_rendering);
 }
