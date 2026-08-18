@@ -1282,6 +1282,7 @@ void GPUrearmedCallbacks(const struct rearmed_cbs *cbs)
   sync_renderer_ecmds(&gpu);
   renderer_set_config(cbs);
   vout_set_config(cbs);
+  gpu_dump_config(cbs);
 
   gpu_async_enable(&gpu, cbs->thread_rendering);
 }

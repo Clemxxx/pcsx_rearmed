@@ -9,6 +9,7 @@
 #include <string.h>
 #include "gpu.h"
 #include "gpu_dump.h"
+#include "../../frontend/plugin_lib.h"
 
 #define DUMP_MAGIC "PSXGDUMP"
 #define DUMP_VERSION 1
@@ -23,11 +24,15 @@ enum {
   CHUNK_VRAM_HASH     = 0x05,
   CHUNK_META          = 0x06,
   CHUNK_GP0_READ      = 0x07,
+  CHUNK_RENDER_CONFIG = 0x08,
 };
 
 static FILE *dump_file;
 static int dump_checked;
 static uint32_t dump_frame;
+static uint32_t render_config[5]; /* old_renderer, ilace_force, lighting,
+                                     fast_lighting, blending */
+static int render_config_known;
 
 static uint64_t fnv1a64(const void *buf, size_t len)
 {
@@ -83,9 +88,23 @@ static int dump_active(struct psx_gpu *gpu)
     const char meta[] = "recorder: pcsx_rearmed gpulib (picastation branch)";
     chunk(CHUNK_META, meta, sizeof(meta) - 1);
   }
+  if (render_config_known)
+    chunk(CHUNK_RENDER_CONFIG, render_config, sizeof(render_config));
   snapshot(gpu);
   fprintf(stderr, "gpu_dump: recording to %s\n", path);
   return 1;
+}
+
+void gpu_dump_config(const struct rearmed_cbs *cbs)
+{
+  render_config[0] = cbs->gpu_unai.old_renderer;
+  render_config[1] = cbs->gpu_unai.ilace_force;
+  render_config[2] = cbs->gpu_unai.lighting;
+  render_config[3] = cbs->gpu_unai.fast_lighting;
+  render_config[4] = cbs->gpu_unai.blending;
+  render_config_known = 1;
+  if (dump_file)
+    chunk(CHUNK_RENDER_CONFIG, render_config, sizeof(render_config));
 }
 
 void gpu_dump_gp0(struct psx_gpu *gpu, const uint32_t *data, int count)

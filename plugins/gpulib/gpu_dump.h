@@ -9,9 +9,11 @@
 #include <stdint.h>
 
 struct psx_gpu;
+struct rearmed_cbs;
 
 #ifdef GPULIB_DUMP_RECORDER
 
+void gpu_dump_config(const struct rearmed_cbs *cbs);
 void gpu_dump_gp0(struct psx_gpu *gpu, const uint32_t *data, int count);
 void gpu_dump_gp1(struct psx_gpu *gpu, uint32_t data);
 void gpu_dump_read(struct psx_gpu *gpu, int count);
@@ -20,6 +22,7 @@ void gpu_dump_finish(void);
 
 #else
 
+#define gpu_dump_config(cbs) do {} while (0)
 #define gpu_dump_gp0(gpu, data, count) do {} while (0)
 #define gpu_dump_gp1(gpu, data) do {} while (0)
 #define gpu_dump_read(gpu, count) do {} while (0)
