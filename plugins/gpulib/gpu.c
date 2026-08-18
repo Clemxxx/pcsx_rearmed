@@ -26,6 +26,8 @@
 //#define log_io gpu_log
 #define log_io(...)
 
+#include "gpu_dump.h"
+
 struct psx_gpu gpu;
 
 static noinline int do_cmd_buffer(struct psx_gpu *gpu, uint32_t *data, int count,
@@ -357,6 +359,7 @@ long GPUshutdown(void)
 {
   long ret;
 
+  gpu_dump_finish();
   gpu_async_stop(&gpu);
   renderer_finish();
   ret = vout_finish();
@@ -378,6 +381,8 @@ void GPUwriteStatus(uint32_t data)
   uint32_t cmd = data >> 24;
   uint32_t fb_dirty = 1, frame;
   int src_x, src_y, changed;
+
+  gpu_dump_gp1(&gpu, data);
 
   if (cmd < ARRAY_SIZE(gpu.regs)) {
     if (cmd > 1 && cmd != 5 && gpu.regs[cmd] == data)
@@ -824,7 +829,7 @@ breakloop:
   return pos;
 }
 
-static noinline int do_cmd_buffer(struct psx_gpu *gpu, uint32_t *data, int count,
+static noinline int do_cmd_buffer_core(struct psx_gpu *gpu, uint32_t *data, int count,
     int *cycles_sum, int *cycles_last)
 {
   int cmd, pos;
@@ -912,6 +917,16 @@ static noinline int do_cmd_buffer(struct psx_gpu *gpu, uint32_t *data, int count
   gpu->state.fb_dirty |= vram_dirty;
 
   return count - pos;
+}
+
+/* records only the consumed prefix; leftover words are re-fed by callers
+ * and would otherwise be recorded twice */
+static noinline int do_cmd_buffer(struct psx_gpu *gpu, uint32_t *data, int count,
+    int *cycles_sum, int *cycles_last)
+{
+  int left = do_cmd_buffer_core(gpu, data, count, cycles_sum, cycles_last);
+  gpu_dump_gp0(gpu, data, count - left);
+  return left;
 }
 
 static noinline void flush_cmd_buffer(struct psx_gpu *gpu)
@@ -1042,8 +1057,10 @@ void GPUreadDataMem(uint32_t *mem, int count)
     sync_ecmds_status_bits(&gpu);
   }
 
-  if (gpu.dma.h)
+  if (gpu.dma.h) {
+    gpu_dump_read(&gpu, count);
     do_vram_io(&gpu, mem, count, 1);
+  }
 }
 
 uint32_t GPUreadData(void)
@@ -1057,6 +1074,7 @@ uint32_t GPUreadData(void)
 
   ret = gpu.gp0;
   if (gpu.dma.h) {
+    gpu_dump_read(&gpu, 1);
     ret = HTOLE32(ret);
     do_vram_io(&gpu, &ret, 1, 1);
     ret = LE32TOH(ret);
@@ -1136,6 +1154,8 @@ static void GPUupdateLace(void)
     flush_cmd_buffer(&gpu);
     sync_ecmds_status_bits(&gpu);
   }
+
+  gpu_dump_vblank(&gpu);
 
 #ifndef RAW_FB_DISPLAY
   if (gpu.status & PSX_GPU_STATUS_BLANKING) {

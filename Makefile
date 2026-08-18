@@ -266,6 +266,10 @@ endif
 
 # builtin gpu
 OBJS += plugins/gpulib/gpu.o plugins/gpulib/vout_pl.o plugins/gpulib/prim.o
+ifeq "$(GPULIB_DUMP)" "1"
+OBJS += plugins/gpulib/gpu_dump.o
+CFLAGS += -DGPULIB_DUMP_RECORDER
+endif
 ifeq "$(USE_ASYNC_GPU)" "1"
 OBJS += plugins/gpulib/gpu_async.o
 plugins/gpulib/%.o: CFLAGS += -DUSE_ASYNC_GPU
