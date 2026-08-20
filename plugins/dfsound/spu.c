@@ -1179,8 +1179,17 @@ void schedule_next_irq(void)
 
 // rearmed: called dynamically now
 
+#ifdef _3DS
+#include <3ds/types.h>
+#include <3ds/svc.h>
+long long spu3ds_ticks; /* drained by the PicaStation frontend heartbeat */
+#endif
+
 void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
 {
+#ifdef _3DS
+ u64 t0_ = svcGetSystemTick();
+#endif
  do_samples(cycle, 0);
 
  if (spu.spuCtrl & CTRL_IRQ)
@@ -1197,6 +1206,9 @@ void CALLBACK SPUasync(unsigned int cycle, unsigned int flags)
     spu.cycles_played -= 44100 / 60 / 2 * 768;
   }
  }
+#ifdef _3DS
+ spu3ds_ticks += (long long)(svcGetSystemTick() - t0_);
+#endif
 }
 
 // SPU UPDATE... new epsxe func

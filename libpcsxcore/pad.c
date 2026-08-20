@@ -536,6 +536,19 @@ unsigned char PAD1_startPoll(void)
 	pad->requestPadIndex = 0;
 	PAD1_readPort(pad, &pad->portMultitap);
 
+#ifdef _3DS
+	{ /* input-delivery probe: log the state the game actually receives
+	   * whenever any button is held (buttonStatus is active-low) */
+		static int probes;
+		if (pad->buttonStatus != 0xffff && probes < 40) {
+			probes++;
+			SysPrintf("padpoll: %04x mt=%d type=%d\n",
+				  pad->buttonStatus, pad->portMultitap,
+				  pad->controllerType);
+		}
+	}
+#endif
+
 	if (PADstartPollMain(pad)) {
 		// a multitap is plugged and enabled: refresh pads 1-3
 		for (i = 1; i < 4; i++) {

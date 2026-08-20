@@ -1195,6 +1195,27 @@ static void intExecute(psxRegisters *regs) {
 		regs->ptrs.intFetch;
 	const uintptr_t *memRLUT = regs->ptrs.memRLUT;
 
+#ifdef _3DS
+	/* PicaStation profiler: sample the guest PC every 1024 executed
+	 * instructions. The dynarec keeps the PC in registers (psxRegs.pc
+	 * just sits at the exception vector), so profiling the guest has to
+	 * ride the interpreter. The sample count per frame doubles as an
+	 * instruction count, which is what identifies the game's periodic
+	 * heavy tick — no dependence on wall-clock timing. */
+	{
+		extern volatile int pica_pcs_on;
+		extern void pica_pcsample(unsigned int pc);
+		static unsigned int ctr;
+		if (pica_pcs_on) {
+			while (!regs->stop) {
+				execI_(fetch, memRLUT, regs);
+				if (!(++ctr & 1023))
+					pica_pcsample(regs->pc);
+			}
+			return;
+		}
+	}
+#endif
 	while (!regs->stop)
 		execI_(fetch, memRLUT, regs);
 }

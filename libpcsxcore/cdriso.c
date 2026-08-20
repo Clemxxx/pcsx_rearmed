@@ -177,7 +177,13 @@ static off_t get_size(FILE *f)
 static void set_static_stdio_buffer(FILE *f)
 {
 #if !defined(fopen) // no stdio redirect
+#ifdef _3DS
+	// 3DS: SD-card round trips are the emulator's worst cost; buffer
+	// ~55 sectors so streamed FMV/XA refills rarely
+	static char buf[128 * 1024];
+#else
 	static char buf[16 * 1024];
+#endif
 	if (f) {
 		int r;
 		errno = 0;
@@ -1155,16 +1161,48 @@ static int opensbifile(const char *isoname) {
 	return LoadSBI(sbiname, ti[1].length);
 }
 
+// sequential-read fast path: streamed FMV/XA reads sectors in order, and
+// on some platforms (3DS FAT) every fseeko is expensive; skip it when the
+// stream is already at the target. Cache invalidated on handle change,
+// on any short/failed read, and in ISOopen.
+static FILE *seq_cache_f;
+static off_t seq_cache_pos = -1;
+
+#ifdef _3DS
+static unsigned int cdr_read_calls, cdr_read_ms;
+#include <time.h>
+#endif
+
 static int cdread_normal(FILE *f, unsigned int base, void *dest, int sector)
 {
 	int ret;
+	off_t want = (off_t)base + (off_t)sector * CD_FRAMESIZE_RAW;
+#ifdef _3DS
+	clock_t t0 = clock();
+#endif
 	if (!f)
 		return -1;
 	if (!dest)
 		dest = cdbuffer;
-	if (fseeko(f, base + sector * CD_FRAMESIZE_RAW, SEEK_SET))
+	/* NOTE: an earlier version skipped this fseeko when seq_cache_pos
+	 * matched, but position tracking cannot see every reader of this
+	 * handle; suspected of scrambling MGS's interleaved FMV stream
+	 * (wrong-sector macroblock mosaic). Always seek — newlib makes
+	 * in-buffer seeks cheap with the 128KB stdio buffer. */
+	(void)seq_cache_f;
+	if (fseeko(f, want, SEEK_SET)) {
+		seq_cache_pos = -1;
 		goto fail_io;
+	}
 	ret = fread(dest, 1, CD_FRAMESIZE_RAW, f);
+	seq_cache_f = f;
+	seq_cache_pos = ret > 0 ? want + ret : -1;
+#ifdef _3DS
+	cdr_read_ms += (unsigned int)((clock() - t0) * 1000 / CLOCKS_PER_SEC);
+	if (++cdr_read_calls % 512 == 0)
+		SysPrintf("cdr: 512 reads in %u ms (sector %d)\n",
+			  cdr_read_ms, sector), cdr_read_ms = 0;
+#endif
 	if (ret <= 0)
 		goto fail_io;
 	return ret;
@@ -1437,6 +1475,9 @@ static void PrintTracks(void) {
 // file for playback
 int ISOopen(const char *fname)
 {
+	seq_cache_f = NULL;
+	seq_cache_pos = -1;
+	SysPrintf("cdriso: seq-cache build v2\n");
 	boolean isMode1ISO = FALSE;
 	char alt_bin_filename[MAXPATHLEN];
 	const char *bin_filename;

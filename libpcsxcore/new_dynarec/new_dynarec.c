@@ -30,6 +30,10 @@
 #endif
 #ifdef _3DS
 #include <3ds_utils.h>
+#include <3ds/svc.h>
+/* PicaStation: recompiler cost, drained per frame by the frontend */
+long long ndrc3ds_compile_ticks;
+int ndrc3ds_compile_calls;
 #endif
 #ifdef HAVE_LIBNX
 #include <switch.h>
@@ -1105,6 +1109,25 @@ static void noinline *get_addr(struct ht_entry *ht, const u_int vaddr,
   if (set_smrv_regs)
     memcpy(ndrc_smrv_regs, psxRegs.GPR.r, sizeof(ndrc_smrv_regs));
 
+#ifdef _3DS
+  /* PicaStation: time spent recompiling, drained per frame by the
+   * frontend. The guest PC cannot be profiled under the dynarec, so
+   * this is how we tell "the game did more work" apart from "we spent
+   * the frame compiling". */
+  {
+    extern long long ndrc3ds_compile_ticks;
+    extern int ndrc3ds_compile_calls;
+    unsigned long long t0_ = svcGetSystemTick();
+    int r = new_recompile_block(vaddr);
+    ndrc3ds_compile_ticks += (long long)(svcGetSystemTick() - t0_);
+    ndrc3ds_compile_calls++;
+    if (likely(r == 0))
+      return ndrc_get_addr_ht(vaddr, ht);
+    if (compile_mode == ndrc_cm_compile_live)
+      return ndrc_get_addr_ht(generate_exception(vaddr), ht);
+    return NULL;
+  }
+#endif
   int r = new_recompile_block(vaddr);
   if (likely(r == 0))
     return ndrc_get_addr_ht(vaddr, ht);
