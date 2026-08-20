@@ -18,6 +18,10 @@ void SetupSound(void)
 	int i;
 
 	if (driver_count == 0) {
+#ifdef _3DS
+		/* PicaStation: NDSP first, declines if no dumped dspfirm */
+		REGISTER_DRIVER(ndsp3ds);
+#endif
 #ifdef HAVE_OSS
 		REGISTER_DRIVER(oss);
 #endif
