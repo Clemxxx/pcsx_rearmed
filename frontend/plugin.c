@@ -24,9 +24,18 @@
 #include "../plugins/dfsound/spu.h"
 
 /* PAD */
+#ifdef _3DS
+/* PicaStation: refresh + timestamp the pad at game-poll time (real
+ * hardware samples the pad when the game polls it — serving the
+ * frame-start snapshot adds up to a frame of input latency) */
+void pica_pad_poll_refresh(int pad_index);
+#endif
 void PAD1_readPort(PadDataS *pad, int *is_multitap) {
 	int pad_index = pad->requestPadIndex;
 
+#ifdef _3DS
+	pica_pad_poll_refresh(pad_index);
+#endif
 	pad->controllerType = in_type[pad_index];
 	pad->buttonStatus = ~in_keystate[pad_index];
 
