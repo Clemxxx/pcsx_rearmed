@@ -1301,7 +1301,11 @@ gte_handler * NM(gteGetHandler)(u32 code)
  * and the newer wins -- harmless, they are at the same place on screen.
  * Sized well above a frame's vertex count so a frame never evicts
  * itself. */
-#define PGXP_N 8192
+/* 8192 slots evicted hard: with entries living several epochs, a few
+ * thousand keys were competing and 59% of all misses were an occupied
+ * slot holding SOMEONE ELSE'S key. Not a hash-quality problem alone --
+ * the table was simply too small for the working set. */
+#define PGXP_N 32768
 /* how many epochs (vblanks) an entry stays usable */
 #define PGXP_SLACK 4
 /* epoch = the frame this transform belongs to; amb = two vertices with
@@ -1330,6 +1334,7 @@ unsigned pgxp_writes, pgxp_amb, pgxp_stale;
 /* the projection the GTE itself used, so a consumer can re-project the
  * view-space vectors exactly rather than guessing a focal length */
 float pgxp_ofx, pgxp_ofy, pgxp_h;
+unsigned pgxp_m_empty, pgxp_m_key, pgxp_m_amb;
 
 /* called once per frame by the GPU frontend */
 void pgxp_frame(void)
@@ -1342,19 +1347,33 @@ static u32 pgxp_key(u32 sx, u32 sy)
 	return (sx & 0x7FF) | ((sy & 0x7FF) << 16);
 }
 
+/* Knuth multiplicative. The previous (key ^ (key >> 13)) folded y down
+ * onto x and clustered heavily for screen coordinates, which are dense
+ * in a small range rather than uniformly distributed. */
+static u32 pgxp_slot(u32 key)
+{
+	return (key * 2654435761u) >> (32 - 15);
+}
+
 void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
                s32 vx, s32 vy, s32 vz, s32 ofx, s32 ofy, s32 h)
 {
 	u32 key = pgxp_key((u32)sx, (u32)sy);
-	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
+	pgxp_ent *e = &pgxp_tab[pgxp_slot(key)];
 	float z = (float)sz;
 	if (e->key == key && e->epoch == pgxp_epoch) {
 		/* same pixel, same frame, different depth: one vertex is
 		 * behind the other and the key cannot tell them apart.
 		 * Poison it rather than pick one. */
-		float d = e->z - z;
+		/* RELATIVE tolerance. An absolute 4 units against a depth
+		 * range of ~14000 poisoned vertices whose depths differed by
+		 * a fraction of a percent -- either value would have been
+		 * fine. Only refuse when the two are genuinely at different
+		 * distances. */
+		float d = e->z - z, lim = z * 0.02f;
 		if (d < 0) d = -d;
-		if (d > 4.0f) {
+		if (lim < 2.0f) lim = 2.0f;
+		if (d > lim) {
 			e->amb = 1;
 			pgxp_amb++;
 			return;
@@ -1381,7 +1400,7 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 int pgxp_lookup_v(u32 packed, float *vx, float *vy, float *vz)
 {
 	u32 key = packed & 0x07FF07FFu;
-	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
+	pgxp_ent *e = &pgxp_tab[pgxp_slot(key)];
 	if (!e->epoch || e->key != key || e->amb)
 		return 0;
 	if (pgxp_epoch - e->epoch > PGXP_SLACK)
@@ -1396,9 +1415,22 @@ int pgxp_lookup(u32 packed, float *x, float *y, float *z)
 	 * the top bits of a vertex word (THPS is the documented case), so
 	 * only the coordinate field may take part in the key. */
 	u32 key = packed & 0x07FF07FFu;
-	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
-	if (!e->epoch || e->key != key || e->amb)
+	pgxp_ent *e = &pgxp_tab[pgxp_slot(key)];
+	/* WHY a lookup fails matters: "never transformed" means the game
+	 * reused geometry we never saw the GTE produce, which no amount of
+	 * table tuning can fix. "wrong key" means we evicted it. */
+	if (!e->epoch) {
+		pgxp_m_empty++;
 		return 0;
+	}
+	if (e->key != key) {
+		pgxp_m_key++;
+		return 0;
+	}
+	if (e->amb) {
+		pgxp_m_amb++;
+		return 0;
+	}
 	if (pgxp_epoch - e->epoch > PGXP_SLACK) {
 		/* transformed too long ago to be this packet's provenance —
 		 * a coincidental match on the same pixel, not the same
