@@ -1292,11 +1292,26 @@ gte_handler * NM(gteGetHandler)(u32 code)
  * Sized well above a frame's vertex count so a frame never evicts
  * itself. */
 #define PGXP_N 8192
-typedef struct { u32 key, stamp; float x, y, z; } pgxp_ent;
+/* how many epochs (vblanks) an entry stays usable */
+#define PGXP_SLACK 4
+/* epoch = the frame this transform belongs to; amb = two vertices with
+ * DIFFERENT depth landed on the same integer pixel this frame, so the
+ * key cannot say which one a packet means. Without these two guards
+ * this table is exactly PGXP's "vertex cache", which its own
+ * maintainers say produces glitches in most games and should be left
+ * off — a stale or ambiguous entry matches by coincidence and hands
+ * back a confidently wrong depth. */
+typedef struct { u32 key, epoch; float x, y, z; u8 amb; } pgxp_ent;
 static pgxp_ent pgxp_tab[PGXP_N];
-static u32 pgxp_stamp;
+static u32 pgxp_epoch = 1;
 int pgxp_capture_on;
-unsigned pgxp_writes;
+unsigned pgxp_writes, pgxp_amb, pgxp_stale;
+
+/* called once per frame by the GPU frontend */
+void pgxp_frame(void)
+{
+	pgxp_epoch++;
+}
 
 static u32 pgxp_key(u32 sx, u32 sy)
 {
@@ -1307,11 +1322,26 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz)
 {
 	u32 key = pgxp_key((u32)sx, (u32)sy);
 	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
+	float z = (float)sz;
+	if (e->key == key && e->epoch == pgxp_epoch) {
+		/* same pixel, same frame, different depth: one vertex is
+		 * behind the other and the key cannot tell them apart.
+		 * Poison it rather than pick one. */
+		float d = e->z - z;
+		if (d < 0) d = -d;
+		if (d > 4.0f) {
+			e->amb = 1;
+			pgxp_amb++;
+			return;
+		}
+	} else {
+		e->amb = 0;
+	}
 	e->key = key;
 	e->x = (float)fx / 65536.0f;   /* sub-pixel screen position */
 	e->y = (float)fy / 65536.0f;
-	e->z = (float)sz;              /* view depth, GTE units */
-	e->stamp = ++pgxp_stamp;
+	e->z = z;                      /* view depth, GTE units */
+	e->epoch = pgxp_epoch;
 	pgxp_writes++;
 }
 
@@ -1319,10 +1349,24 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz)
  * transform we saw; 0 when it was not (2D art, CPU-built geometry) */
 int pgxp_lookup(u32 packed, float *x, float *y, float *z)
 {
+	/* The 11-bit mask is NOT cosmetic: some games pack extra data into
+	 * the top bits of a vertex word (THPS is the documented case), so
+	 * only the coordinate field may take part in the key. */
 	u32 key = packed & 0x07FF07FFu;
 	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
-	if (!e->stamp || e->key != key)
+	if (!e->epoch || e->key != key || e->amb)
 		return 0;
+	if (pgxp_epoch - e->epoch > PGXP_SLACK) {
+		/* transformed too long ago to be this packet's provenance —
+		 * a coincidental match on the same pixel, not the same
+		 * vertex. Slack rather than an exact frame because the epoch
+		 * ticks on VBLANK (~60Hz) while a game may render at 30fps,
+		 * and display lists are typically double-buffered: geometry
+		 * is transformed a frame or more before it is drawn. One
+		 * epoch of slack measured 0% hits for exactly this reason. */
+		pgxp_stale++;
+		return 0;
+	}
 	*x = e->x; *y = e->y; *z = e->z;
 	return 1;
 }
