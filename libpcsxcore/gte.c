@@ -1325,6 +1325,7 @@ typedef struct {
 	u32 key, epoch;
 	float x, y, z;
 	float vx, vy, vz;
+	float ofx, ofy, h;   /* the projection THIS vertex was made with */
 	u8 amb;
 } pgxp_ent;
 static pgxp_ent pgxp_tab[PGXP_N];
@@ -1333,7 +1334,6 @@ int pgxp_capture_on;
 unsigned pgxp_writes, pgxp_amb, pgxp_stale;
 /* the projection the GTE itself used, so a consumer can re-project the
  * view-space vectors exactly rather than guessing a focal length */
-float pgxp_ofx, pgxp_ofy, pgxp_h;
 unsigned pgxp_m_empty, pgxp_m_key, pgxp_m_amb;
 
 /* called once per frame by the GPU frontend */
@@ -1389,14 +1389,30 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 	e->vy = (float)vy;
 	e->vz = (float)vz;
 	e->epoch = pgxp_epoch;
-	pgxp_ofx = (float)ofx / 65536.0f;
-	pgxp_ofy = (float)ofy / 65536.0f;
-	pgxp_h = (float)h;
+	/* PER ENTRY, not global. A game may change the projection between
+	 * objects (different FOV for a weapon model, a cutscene camera,
+	 * a UI layer), and a single global left every consumer using
+	 * whichever values happened to be written last that frame. */
+	e->ofx = (float)ofx / 65536.0f;
+	e->ofy = (float)ofy / 65536.0f;
+	e->h = (float)h;
 	pgxp_writes++;
 }
 
 /* returns 1 and fills x/y/z when this packed XY was produced by a
  * transform we saw; 0 when it was not (2D art, CPU-built geometry) */
+int pgxp_lookup_proj(u32 packed, float *ofx, float *ofy, float *h)
+{
+	u32 key = packed & 0x07FF07FFu;
+	pgxp_ent *e = &pgxp_tab[pgxp_slot(key)];
+	if (!e->epoch || e->key != key || e->amb)
+		return 0;
+	if (pgxp_epoch - e->epoch > PGXP_SLACK)
+		return 0;
+	*ofx = e->ofx; *ofy = e->ofy; *h = e->h;
+	return 1;
+}
+
 int pgxp_lookup_v(u32 packed, float *vx, float *vy, float *vz)
 {
 	u32 key = packed & 0x07FF07FFu;

@@ -75,6 +75,8 @@ extern int pgxp_capture_on;
 int pgxp_lookup(u32 packed, float *x, float *y, float *z);
 /* the pre-projection view-space vector, if we have it */
 int pgxp_lookup_v(u32 packed, float *vx, float *vy, float *vz);
+/* the projection parameters that vertex was transformed with */
+int pgxp_lookup_proj(u32 packed, float *ofx, float *ofy, float *h);
 void pgxp_frame(void);   /* call once per emulated frame */
 gte_handler *gteGetHandler(u32 code);
 gte_handler *gteGetHandler_nf(u32 code);
