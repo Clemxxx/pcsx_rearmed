@@ -566,6 +566,19 @@ static u32 gteMAC123f(psxCP2Regs *regs, s32 vx, s32 vy, s32 vz,
 
 #endif
 
+/* ---- PGXP-style geometry capture ----------------------------------
+ * RTPS/RTPT compute the projected screen position in 16.16 fixed point
+ * and then throw the fraction away (the ">> 16" below). That discarded
+ * fraction, plus the view depth sz3, is exactly the 3D information the
+ * GPU never sees -- the PS1 hands its rasterizer flat 2D triangles.
+ * We keep it, keyed by the packed SXY word the game will copy into the
+ * GPU packet, so the renderer can look it up when the primitive
+ * arrives. Value-keyed on purpose: the alternative (shadowing every
+ * store, as stock PGXP does) would mean instrumenting the dynarec.
+ * Defined once -- gte_nf.c re-includes this file with FLAGLESS set. */
+extern int pgxp_capture_on;
+extern void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz);
+
 static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 {
 	s32 vx = gteVX0, vy = gteVY0, vz = gteVZ0;
@@ -593,8 +606,14 @@ static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 	gteSXY0 = gteSXY1;
 	gteSXY1 = gteSXY2;
 
-	gteSX2 = limG1(&flags, mac0flags(&flags, gteOFX + (s64)gteIR1 * quotient) >> 16);
-	gteSY2 = limG2(&flags, mac0flags(&flags, gteOFY + (s64)gteIR2 * quotient) >> 16);
+	{
+		s64 fx = mac0flags(&flags, gteOFX + (s64)gteIR1 * quotient);
+		s64 fy = mac0flags(&flags, gteOFY + (s64)gteIR2 * quotient);
+		gteSX2 = limG1(&flags, fx >> 16);
+		gteSY2 = limG2(&flags, fy >> 16);
+		if (pgxp_capture_on)
+			pgxp_note(fx, fy, gteSX2, gteSY2, sz3);
+	}
 
 	gteMAC0 = mac0 = mac0flags(&flags, gteDQB + (s64)gteDQA * quotient);
 	gteIR0 = limH(&flags, mac0 >> 12);
@@ -629,8 +648,14 @@ static inline force_inline void gteRTPT(psxCP2Regs *regs, int shift, int lm)
 		sz3 = limD(&flags, sz3);
 		quotient = divide(&flags, h, sz3);
 		fSZ(v) = sz3;
-		fSX(v) = limG1(&flags, mac0flags(&flags, gteOFX + (s64)ir1 * quotient) >> 16);
-		fSY(v) = limG2(&flags, mac0flags(&flags, gteOFY + (s64)ir2 * quotient) >> 16);
+		{
+			s64 fx = mac0flags(&flags, gteOFX + (s64)ir1 * quotient);
+			s64 fy = mac0flags(&flags, gteOFY + (s64)ir2 * quotient);
+			fSX(v) = limG1(&flags, fx >> 16);
+			fSY(v) = limG2(&flags, fy >> 16);
+			if (pgxp_capture_on)
+				pgxp_note(fx, fy, fSX(v), fSY(v), sz3);
+		}
 	}
 
 	gteMAC1 = mac1;
@@ -1260,6 +1285,47 @@ gte_handler * NM(gteGetHandler)(u32 code)
 }
 
 #ifndef FLAGLESS
+
+/* Direct-mapped, keyed by the 11-bit-per-axis packed XY the GPU packet
+ * carries. Two vertices that project to the same integer pixel collide
+ * and the newer wins -- harmless, they are at the same place on screen.
+ * Sized well above a frame's vertex count so a frame never evicts
+ * itself. */
+#define PGXP_N 8192
+typedef struct { u32 key, stamp; float x, y, z; } pgxp_ent;
+static pgxp_ent pgxp_tab[PGXP_N];
+static u32 pgxp_stamp;
+int pgxp_capture_on;
+unsigned pgxp_writes;
+
+static u32 pgxp_key(u32 sx, u32 sy)
+{
+	return (sx & 0x7FF) | ((sy & 0x7FF) << 16);
+}
+
+void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz)
+{
+	u32 key = pgxp_key((u32)sx, (u32)sy);
+	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
+	e->key = key;
+	e->x = (float)fx / 65536.0f;   /* sub-pixel screen position */
+	e->y = (float)fy / 65536.0f;
+	e->z = (float)sz;              /* view depth, GTE units */
+	e->stamp = ++pgxp_stamp;
+	pgxp_writes++;
+}
+
+/* returns 1 and fills x/y/z when this packed XY was produced by a
+ * transform we saw; 0 when it was not (2D art, CPU-built geometry) */
+int pgxp_lookup(u32 packed, float *x, float *y, float *z)
+{
+	u32 key = packed & 0x07FF07FFu;
+	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
+	if (!e->stamp || e->key != key)
+		return 0;
+	*x = e->x; *y = e->y; *z = e->z;
+	return 1;
+}
 
 void gteDispatch(psxCP2Regs *regs, u32 code)
 {
