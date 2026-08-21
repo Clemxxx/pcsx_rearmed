@@ -614,8 +614,12 @@ static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 		gteSX2 = limG1(&flags, fx >> 16);
 		gteSY2 = limG2(&flags, fy >> 16);
 		if (pgxp_capture_on)   /* mac1..3 = R*V + TR = view space */
+			/* IR1/IR2/sz3 are exactly what the projection below
+			 * consumes: IR is MAC clamped to +-32767, and sz3 is
+			 * mac3 >> (12-shift). Capturing mac1..3 instead put
+			 * the re-projection out by up to 686 pixels. */
 			pgxp_note(fx, fy, gteSX2, gteSY2, sz3,
-			          mac1, mac2, (s32)mac3,
+			          gteIR1, gteIR2, sz3,
 			          gteOFX, gteOFY, gteH);
 	}
 
@@ -659,7 +663,7 @@ static inline force_inline void gteRTPT(psxCP2Regs *regs, int shift, int lm)
 			fSY(v) = limG2(&flags, fy >> 16);
 			if (pgxp_capture_on)
 				pgxp_note(fx, fy, fSX(v), fSY(v), sz3,
-				          mac1, mac2, (s32)mac3,
+				          ir1, ir2, sz3,
 				          gteOFX, gteOFY, h);
 		}
 	}
