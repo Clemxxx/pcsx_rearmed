@@ -1542,6 +1542,23 @@ int pgxp_mem_enable(void)
 	pgxp_mem_on = 1;
 	return 1;
 }
+
+/* Turn memory mode on or off while the game runs. The recompiler bakes
+ * the hooks in when it compiles a block, so nothing changes for code
+ * already translated -- the caller has to throw the block cache away
+ * for this to take effect, which is why the return value says whether
+ * anything actually changed. Cheap enough for a human action like
+ * moving the 3D slider; far too expensive to do per frame. */
+int pgxp_mem_set(int on)
+{
+	on = on ? 1 : 0;
+	if (!pgxp_shadow && on && !pgxp_shadow_alloc())
+		return 0;
+	if (pgxp_mem_on == on)
+		return 0;
+	pgxp_mem_on = on;
+	return 1;
+}
 /* exact match by address: no collisions, no ambiguity, no guessing */
 int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
                      float *vx, float *vy, float *vz,

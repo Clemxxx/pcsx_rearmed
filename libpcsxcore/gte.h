@@ -122,6 +122,8 @@ extern int pgxp_addr_on;
  * Read by the recompiler at block-compile time, same as above. */
 extern int pgxp_mem_on;
 int  pgxp_mem_enable(void);
+/* returns 1 if the state changed and the block cache must be dropped */
+int  pgxp_mem_set(int on);
 void pgxp_mfc2(u32 rt, u32 creg);
 void pgxp_mem_load(u32 addr, u32 rt);
 void pgxp_mem_store(u32 addr, u32 rt, u32 val);
