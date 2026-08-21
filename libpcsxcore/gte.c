@@ -276,6 +276,80 @@ static inline s64 mac123sub_s12(u32 id, u32 *flags, s32 in12, s32 subtrahend, in
 
 #endif // !FLAGLESS for mac 123
 
+/* ---- DEPTH TAG ---------------------------------------------------
+ * The GPU reads only 11 bits of each 16-bit screen coordinate:
+ *     ps1gpu.c   x = sext11(w & 0x7FF)
+ * so bits 11..15 of each half -- ten bits per vertex -- are discarded
+ * by the hardware. The GTE clamps its output to [-1024,1023] (limG1),
+ * which is exactly 11 bits signed, so those ten bits carry nothing but
+ * sign extension.
+ *
+ * Put the vertex's own depth in them. The game then carries it to the
+ * display list for us, inside a word it treats as opaque -- through
+ * lw/sw, memcpy, the ordering table and the DMA -- and the GPU side
+ * reads the depth straight out of the packet.
+ *
+ * That removes the matching problem completely: there is no table to
+ * look up, nothing to key on, and no vertex that can be missed,
+ * because every vertex carries its own answer. What it costs is the
+ * five spare bits per coordinate, which is only safe while the game
+ * treats the word as opaque -- see the checksum below.
+ *
+ * Written into the SXY FIFO itself, not into MFC2's return value, so
+ * that the recompiler (which reads the register file directly) sees it
+ * without any emitted call. The one GTE op that reads the FIFO back is
+ * NCLIP, which masks to 11 bits when this is on.
+ */
+/* sign-extend a tagged coordinate from bit 10 */
+static s32 tag11(s32 v) { return (s32)((u32)v << 21) >> 21; }
+
+/* 8-bit floating depth: 4-bit exponent, 4-bit mantissa. 16 steps per
+ * octave is 4.4% relative error, which at a 20px parallax budget is
+ * under a pixel -- and the panel cannot show sub-pixel parallax
+ * anyway (docs/STEREO_3D_NOTES.md). */
+static u32 gte_depth_code(u32 sz)
+{
+	int e;
+	if (sz > 0xffff)
+		sz = 0xffff;
+	if (sz < 16)
+		return sz;                 /* codes 0..15 are exact */
+	for (e = 15; e > 4; e--)
+		if (sz >> e)
+			break;
+	return (u32)((e << 4) | ((sz >> (e - 4)) & 0xf));
+}
+
+/* Two bits of checksum over the coordinate AND the depth. Its job is
+ * not to catch random data -- untagged coordinates are sign-extended,
+ * so their tag bits are all-0 or all-1 and stand out -- but to catch a
+ * word the GAME modified. If a game adds an offset to the packed
+ * coordinate, the checksum no longer matches and the vertex falls back
+ * to flat, which is the same fail-safe rule PGXP uses. */
+static u32 gte_tag_sum(u32 x, u32 y, u32 d)
+{
+	u32 s = x * 5u + y * 3u + d * 7u;
+	s ^= s >> 5;
+	s ^= s >> 3;
+	return (s + 1u) & 3u;        /* +1: never 0 for an all-zero vertex */
+}
+
+/* BISECT: everything the tag switches on -- the C handlers for
+ * RTPS/RTPT/NCLIP, the NCLIP masking, the decode path -- but the word
+ * itself left exactly as the GTE produced it. If the picture is still
+ * wrong with this on, the fault is in those changes and not in the
+ * bits we borrowed. */
+static u32 gte_tag_encode(u32 xy, u32 sz)
+{
+	u32 x = xy & 0x7ffu, y = (xy >> 16) & 0x7ffu;
+	if (gte_tag_null)
+		return xy;
+	u32 d = gte_depth_code(sz);
+	u32 t = (gte_tag_sum(x, y, d) << 8) | d;
+	return (x | ((t & 0x1fu) << 11)) |
+	       ((y | (((t >> 5) & 0x1fu) << 11)) << 16);
+}
+
 #ifndef FLAGLESS
 
 static inline s64 mac0flags(u32 *flags, s64 a) {
@@ -431,6 +505,12 @@ static inline u32 ir2rgb(s32 ir)
 		ir = 0x1f;
 	return ir;
 }
+
+/* defined once: the flagless twin of this file (gte_nf.c) includes it
+ * with FLAGLESS set and must not duplicate them */
+int gte_tag_on;
+int gte_tag_null;
+u32 gte_tag_h = 1000;      /* the projection distance, for the consumer */
 
 u32 MFC2(struct psxCP2Regs *regs, int reg) {
 	switch (reg) {
@@ -614,6 +694,10 @@ static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 		s64 fy = mac0flags(&flags, gteOFY + (s64)gteIR2 * quotient);
 		gteSX2 = limG1(&flags, fx >> 16);
 		gteSY2 = limG2(&flags, fy >> 16);
+		if (gte_tag_on) {
+			gteSXY2 = gte_tag_encode(gteSXY2, (u32)sz3);
+			gte_tag_h = gteH;
+		}
 		if (pgxp_capture_on)   /* mac1..3 = R*V + TR = view space */
 			/* IR1/IR2/sz3 are exactly what the projection below
 			 * consumes: IR is MAC clamped to +-32767, and sz3 is
@@ -662,6 +746,11 @@ static inline force_inline void gteRTPT(psxCP2Regs *regs, int shift, int lm)
 			s64 fy = mac0flags(&flags, gteOFY + (s64)ir2 * quotient);
 			fSX(v) = limG1(&flags, fx >> 16);
 			fSY(v) = limG2(&flags, fy >> 16);
+			if (gte_tag_on) {
+				regs->CP2D.r[12 + v] =
+					gte_tag_encode(regs->CP2D.r[12 + v], (u32)sz3);
+				gte_tag_h = h;
+			}
 			if (pgxp_capture_on)
 				pgxp_note(fx, fy, fSX(v), fSY(v), sz3,
 				          ir1, ir2, sz3,
@@ -783,6 +872,19 @@ static inline void gteNCLIP_(psxCP2Regs *regs)
 
 	GTE_LOG("GTE NCLIP\n");
 
+	if (gte_tag_on) {
+		/* the top five bits of each coordinate carry the depth tag, and
+		 * back-face culling must not see them: sign-extend from bit 10,
+		 * which is the whole range limG1/limG2 can produce anyway */
+		s32 x0 = tag11(gteSX0), y0 = tag11(gteSY0);
+		s32 x1 = tag11(gteSX1), y1 = tag11(gteSY1);
+		s32 x2 = tag11(gteSX2), y2 = tag11(gteSY2);
+		gteMAC0 = mac0flags(&flags, (s64)(x0 * (y1 - y2)) +
+					x1 * (y2 - y0) +
+					x2 * (y0 - y1));
+		gteFLAG = getFinalFlag(flags);
+		return;
+	}
 	gteMAC0 = mac0flags(&flags, (s64)(gteSX0 * (gteSY1 - gteSY2)) +
 				gteSX1 * (gteSY2 - gteSY0) +
 				gteSX2 * (gteSY0 - gteSY1));

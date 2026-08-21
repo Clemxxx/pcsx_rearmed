@@ -2066,7 +2066,7 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
        * during GPUinit, before any game code is compiled, and never
        * changes afterwards. */
       case GTEOP_RTPS:
-        if (shift && !lm && !pgxp_capture_on) {
+        if (shift && !lm && !pgxp_capture_on && !gte_tag_on) {
 #if defined(__ARM_NEON__)
           handler = need_flags ? gteRTPS_sf1lm0_neon : gteRTPS_sf1lm0_nf_neon;
 #elif defined(HAVE_ARMV5)
@@ -2075,7 +2075,7 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
         }
         goto do_handler;
       case GTEOP_RTPT:
-        if (shift && !lm && !pgxp_capture_on) {
+        if (shift && !lm && !pgxp_capture_on && !gte_tag_on) {
 #if defined(__ARM_NEON__)
           handler = need_flags ? gteRTPT_sf1lm0_neon : gteRTPT_sf1lm0_nf_neon;
 #elif defined(HAVE_ARMV5)
@@ -2084,7 +2084,9 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
         }
         goto do_handler;
       case GTEOP_NCLIP:
-        if (need_flags)
+        /* the asm NCLIP reads the raw SXY registers, which carry the
+         * depth tag when it is on -- it would cull on garbage */
+        if (need_flags && !gte_tag_on)
           handler = gteNCLIP_arm;
         goto do_handler;
       case GTEOP_OP:

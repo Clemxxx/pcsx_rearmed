@@ -116,6 +116,16 @@ void gteMACtoRGB_nf(struct psxCP2Regs *regs);
  * is, pgxp_store() is a no-op and every lookup misses. It is also what
  * the recompiler tests to decide whether to emit the SWC2 hook, so it
  * has to run during GPUinit, before any game code is compiled. */
+/* Depth tag: the GTE writes each vertex's own depth into the five bits
+ * of each screen coordinate that the GPU discards, so the game carries
+ * it to the display list inside a word it treats as opaque. No table,
+ * no lookup, no vertex that can be missed. Costs the GTE C handlers
+ * for RTPS/RTPT/NCLIP (the asm ones bypass it).
+ * gte_tag_h is the projection distance the consumer needs alongside
+ * the depth; it changes rarely, so one global is enough. */
+extern int gte_tag_on;
+extern int gte_tag_null;
+extern u32 gte_tag_h;
 extern int pgxp_addr_on;
 /* memory mode: propagate the tag through mfc2 / lw / sw so it
  * survives the copy from the GTE work buffer into the display list.
