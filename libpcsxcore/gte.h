@@ -73,6 +73,8 @@ typedef void (gte_handler)(psxCP2Regs *regs, u32 code);
  * fast paths for those two ops (see assem_arm.c). */
 extern int pgxp_capture_on;
 int pgxp_lookup(u32 packed, float *x, float *y, float *z);
+/* the pre-projection view-space vector, if we have it */
+int pgxp_lookup_v(u32 packed, float *vx, float *vy, float *vz);
 void pgxp_frame(void);   /* call once per emulated frame */
 gte_handler *gteGetHandler(u32 code);
 gte_handler *gteGetHandler_nf(u32 code);

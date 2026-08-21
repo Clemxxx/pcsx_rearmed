@@ -577,7 +577,9 @@ static u32 gteMAC123f(psxCP2Regs *regs, s32 vx, s32 vy, s32 vz,
  * store, as stock PGXP does) would mean instrumenting the dynarec.
  * Defined once -- gte_nf.c re-includes this file with FLAGLESS set. */
 extern int pgxp_capture_on;
-extern void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz);
+extern void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
+                      s32 vx, s32 vy, s32 vz,
+                      s32 ofx, s32 ofy, s32 h);
 
 static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 {
@@ -611,8 +613,10 @@ static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 		s64 fy = mac0flags(&flags, gteOFY + (s64)gteIR2 * quotient);
 		gteSX2 = limG1(&flags, fx >> 16);
 		gteSY2 = limG2(&flags, fy >> 16);
-		if (pgxp_capture_on)
-			pgxp_note(fx, fy, gteSX2, gteSY2, sz3);
+		if (pgxp_capture_on)   /* mac1..3 = R*V + TR = view space */
+			pgxp_note(fx, fy, gteSX2, gteSY2, sz3,
+			          mac1, mac2, (s32)mac3,
+			          gteOFX, gteOFY, gteH);
 	}
 
 	gteMAC0 = mac0 = mac0flags(&flags, gteDQB + (s64)gteDQA * quotient);
@@ -654,7 +658,9 @@ static inline force_inline void gteRTPT(psxCP2Regs *regs, int shift, int lm)
 			fSX(v) = limG1(&flags, fx >> 16);
 			fSY(v) = limG2(&flags, fy >> 16);
 			if (pgxp_capture_on)
-				pgxp_note(fx, fy, fSX(v), fSY(v), sz3);
+				pgxp_note(fx, fy, fSX(v), fSY(v), sz3,
+				          mac1, mac2, (s32)mac3,
+				          gteOFX, gteOFY, h);
 		}
 	}
 
@@ -1301,11 +1307,25 @@ gte_handler * NM(gteGetHandler)(u32 code)
  * maintainers say produces glitches in most games and should be left
  * off — a stale or ambiguous entry matches by coincidence and hands
  * back a confidently wrong depth. */
-typedef struct { u32 key, epoch; float x, y, z; u8 amb; } pgxp_ent;
+/* x,y = precise screen position; z = view depth; vx,vy,vz = the FULL
+ * view-space vector the GTE computed before it projected anything.
+ * Stock PGXP keeps only the projected values, because its goal is
+ * perspective-correct texturing. Ours is stereo, and a real 3D vector
+ * lets each eye be projected from its own camera rather than nudged
+ * sideways -- so keep both. */
+typedef struct {
+	u32 key, epoch;
+	float x, y, z;
+	float vx, vy, vz;
+	u8 amb;
+} pgxp_ent;
 static pgxp_ent pgxp_tab[PGXP_N];
 static u32 pgxp_epoch = 1;
 int pgxp_capture_on;
 unsigned pgxp_writes, pgxp_amb, pgxp_stale;
+/* the projection the GTE itself used, so a consumer can re-project the
+ * view-space vectors exactly rather than guessing a focal length */
+float pgxp_ofx, pgxp_ofy, pgxp_h;
 
 /* called once per frame by the GPU frontend */
 void pgxp_frame(void)
@@ -1318,7 +1338,8 @@ static u32 pgxp_key(u32 sx, u32 sy)
 	return (sx & 0x7FF) | ((sy & 0x7FF) << 16);
 }
 
-void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz)
+void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
+               s32 vx, s32 vy, s32 vz, s32 ofx, s32 ofy, s32 h)
 {
 	u32 key = pgxp_key((u32)sx, (u32)sy);
 	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
@@ -1341,12 +1362,30 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz)
 	e->x = (float)fx / 65536.0f;   /* sub-pixel screen position */
 	e->y = (float)fy / 65536.0f;
 	e->z = z;                      /* view depth, GTE units */
+	e->vx = (float)vx;             /* view space, same units as z */
+	e->vy = (float)vy;
+	e->vz = (float)vz;
 	e->epoch = pgxp_epoch;
+	pgxp_ofx = (float)ofx / 65536.0f;
+	pgxp_ofy = (float)ofy / 65536.0f;
+	pgxp_h = (float)h;
 	pgxp_writes++;
 }
 
 /* returns 1 and fills x/y/z when this packed XY was produced by a
  * transform we saw; 0 when it was not (2D art, CPU-built geometry) */
+int pgxp_lookup_v(u32 packed, float *vx, float *vy, float *vz)
+{
+	u32 key = packed & 0x07FF07FFu;
+	pgxp_ent *e = &pgxp_tab[(key ^ (key >> 13)) & (PGXP_N - 1)];
+	if (!e->epoch || e->key != key || e->amb)
+		return 0;
+	if (pgxp_epoch - e->epoch > PGXP_SLACK)
+		return 0;
+	*vx = e->vx; *vy = e->vy; *vz = e->vz;
+	return 1;
+}
+
 int pgxp_lookup(u32 packed, float *x, float *y, float *z)
 {
 	/* The 11-bit mask is NOT cosmetic: some games pack extra data into
