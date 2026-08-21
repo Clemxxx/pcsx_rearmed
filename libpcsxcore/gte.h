@@ -115,7 +115,7 @@ void gteMACtoRGB_nf(struct psxCP2Regs *regs);
  * written; pgxp_addr_lookup() matches a display-list word back to the
  * exact transform that produced it. Unlike the screen coordinate, an
  * address is unique, so this has no ambiguity to resolve. */
-void pgxp_store(u32 addr, int creg);
-int pgxp_addr_lookup(u32 addr, float *x, float *y, float *z,
+void pgxp_store(u32 addr, int creg, u32 val);
+int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
                      float *vx, float *vy, float *vz,
                      float *ofx, float *ofy, float *h);

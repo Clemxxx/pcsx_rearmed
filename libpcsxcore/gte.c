@@ -620,7 +620,7 @@ static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 			 * the re-projection out by up to 686 pixels. */
 			pgxp_note(fx, fy, gteSX2, gteSY2, sz3,
 			          gteIR1, gteIR2, sz3,
-			          gteOFX, gteOFY, gteH, 2);   /* RTPS -> SXY2 */
+			          gteOFX, gteOFY, gteH, 3);   /* RTPS: PUSH */
 	}
 
 	gteMAC0 = mac0 = mac0flags(&flags, gteDQB + (s64)gteDQA * quotient);
@@ -1369,14 +1369,22 @@ static u32 pgxp_slot(u32 key)
  * This does NOT need memory shadowing. Full PGXP instruments every load
  * and store; we only need the one instruction that drains the GTE. */
 #define PGXP_ADDR_N 16384
-typedef struct { u32 addr, epoch; pgxp_ent e; } pgxp_addr_ent;
+/* `val` is a COPY of the word we saw written to this address. Real
+ * PGXP carries the same field and compares it before trusting a tag —
+ * it is the whole safety model, not an optimisation. Without it, a
+ * display-list slot rewritten by a plain `sw` (which we never see,
+ * because we only hook SWC2) keeps its OLD transform, and the next
+ * packet at that address inherits a stale depth. The whole primitive
+ * then gets a coherent-but-wrong depth, which is precisely the
+ * scattering we measured: self-consistent per polygon, badly placed. */
+typedef struct { u32 addr, epoch, val; pgxp_ent e; } pgxp_addr_ent;
 static pgxp_addr_ent pgxp_atab[PGXP_ADDR_N];
 static pgxp_ent pgxp_fifo[4];      /* what is in SXY0..SXY2, SXYP */
-unsigned pgxp_stores, pgxp_addr_hit, pgxp_addr_miss;
+unsigned pgxp_stores, pgxp_addr_hit, pgxp_addr_miss, pgxp_addr_stale;
 
 /* called from gteSWC2: the game just wrote CP2D register `creg` to
  * `addr`. Only the screen-coordinate FIFO carries geometry we track. */
-void pgxp_store(u32 addr, int creg)
+void pgxp_store(u32 addr, int creg, u32 val)
 {
 	pgxp_addr_ent *a;
 	int slot;
@@ -1391,12 +1399,13 @@ void pgxp_store(u32 addr, int creg)
 	a = &pgxp_atab[(addr >> 2) & (PGXP_ADDR_N - 1)];
 	a->addr = addr;
 	a->epoch = pgxp_epoch;
+	a->val = val;              /* what memory held when we recorded it */
 	a->e = pgxp_fifo[slot];
 	pgxp_stores++;
 }
 
 /* exact match by address: no collisions, no ambiguity, no guessing */
-int pgxp_addr_lookup(u32 addr, float *x, float *y, float *z,
+int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
                      float *vx, float *vy, float *vz,
                      float *ofx, float *ofy, float *h)
 {
@@ -1406,6 +1415,12 @@ int pgxp_addr_lookup(u32 addr, float *x, float *y, float *z,
 	if (!a->epoch || a->addr != addr ||
 	    pgxp_epoch - a->epoch > PGXP_SLACK) {
 		pgxp_addr_miss++;
+		return 0;
+	}
+	if (a->val != val) {
+		/* memory changed behind our back: this word is no longer the
+		 * one we recorded, so the transform does not describe it */
+		pgxp_addr_stale++;
 		return 0;
 	}
 	*x = a->e.x; *y = a->e.y; *z = a->e.z;
@@ -1421,6 +1436,54 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 	u32 key = pgxp_key((u32)sx, (u32)sy);
 	pgxp_ent *e = &pgxp_tab[pgxp_slot(key)];
 	float z = (float)sz;
+	{
+		/* Mirror into the screen FIFO FIRST, built from the ARGUMENTS
+		 * rather than from the hash entry. The hash path can bail
+		 * early — an ambiguous pixel poisons its slot and returns —
+		 * and when it did, the FIFO kept the PREVIOUS vertex's
+		 * transform, so the next SWC2 recorded that stale transform
+		 * against this vertex's address and the geometry jumped to an
+		 * inherited depth. Which register holds what has nothing to do
+		 * with whether the pixel key is contested.
+		 *
+		 * The two ops also fill the FIFO differently, and conflating
+		 * them corrupts two slots of three:
+		 *   RTPS pushes  — SXY0 <- SXY1 <- SXY2, writes SXY2 (slot 3)
+		 *   RTPT writes  — SXY0, SXY1, SXY2 directly (slots 0..2) */
+		pgxp_ent f;
+		float px = (float)fx / 65536.0f;
+		float py = (float)fy / 65536.0f;
+		/* SATURATE like the hardware does. limG1/limG2 clamp the
+		 * architectural SX2/SY2 to [-1024, 1023] and the depth is
+		 * floored at H/2. Keeping the raw projection instead lets a
+		 * vertex near or behind the camera carry a position hundreds
+		 * of units off-screen while its packed word says "screen
+		 * edge" — and no value check can catch that, because the word
+		 * IS the clamped one. It validates, then flings the triangle
+		 * across the frame. */
+		if (px < -1024.0f) px = -1024.0f;
+		if (px > 1023.0f) px = 1023.0f;
+		if (py < -1024.0f) py = -1024.0f;
+		if (py > 1023.0f) py = 1023.0f;
+		if (z < (float)h * 0.5f) z = (float)h * 0.5f;
+		f.key = key;
+		f.epoch = pgxp_epoch;
+		f.x = px;
+		f.y = py;
+		f.z = z;
+		f.vx = (float)vx; f.vy = (float)vy; f.vz = (float)vz;
+		f.ofx = (float)ofx / 65536.0f;
+		f.ofy = (float)ofy / 65536.0f;
+		f.h = (float)h;
+		f.amb = 0;
+		if (slot == 3) {
+			pgxp_fifo[0] = pgxp_fifo[1];
+			pgxp_fifo[1] = pgxp_fifo[2];
+			pgxp_fifo[2] = f;
+		} else if (slot >= 0 && slot < 3) {
+			pgxp_fifo[slot] = f;
+		}
+	}
 	if (e->key == key && e->epoch == pgxp_epoch) {
 		/* same pixel, same frame, different depth: one vertex is
 		 * behind the other and the key cannot tell them apart.
@@ -1457,14 +1520,6 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 	e->ofy = (float)ofy / 65536.0f;
 	e->h = (float)h;
 	pgxp_writes++;
-	/* mirror into the FIFO slot this transform just landed in, and
-	 * shift as the hardware does, so a later SWC2 can find it */
-	if (slot == 2) {
-		pgxp_fifo[0] = pgxp_fifo[1];
-		pgxp_fifo[1] = pgxp_fifo[2];
-	}
-	if (slot >= 0 && slot < 3)
-		pgxp_fifo[slot] = *e;
 }
 
 /* returns 1 and fills x/y/z when this packed XY was produced by a

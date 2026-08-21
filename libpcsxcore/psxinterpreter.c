@@ -1064,8 +1064,11 @@ OP(gteSWC2) {
 	 * coordinate, no two vertices can share it. Record it so the GPU
 	 * side can match a packet word to the exact transform that made it.
 	 * See pgxp_store() in gte.c. */
-	pgxp_store(_oB_, _Rt_);
-	psxMemWrite32(regs_, _oB_, MFC2(&regs_->CP2, _Rt_));
+	{
+		u32 v = MFC2(&regs_->CP2, _Rt_);
+		pgxp_store(_oB_, _Rt_, v);   /* remember the value too */
+		psxMemWrite32(regs_, _oB_, v);
+	}
 }
 
 OP(gteSWC2_stall) {
