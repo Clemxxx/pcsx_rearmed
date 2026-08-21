@@ -579,7 +579,7 @@ static u32 gteMAC123f(psxCP2Regs *regs, s32 vx, s32 vy, s32 vz,
 extern int pgxp_capture_on;
 extern void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
                       s32 vx, s32 vy, s32 vz,
-                      s32 ofx, s32 ofy, s32 h);
+                      s32 ofx, s32 ofy, s32 h, int slot);
 
 static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 {
@@ -620,7 +620,7 @@ static inline force_inline void gteRTPS(psxCP2Regs *regs, int shift, int lm)
 			 * the re-projection out by up to 686 pixels. */
 			pgxp_note(fx, fy, gteSX2, gteSY2, sz3,
 			          gteIR1, gteIR2, sz3,
-			          gteOFX, gteOFY, gteH);
+			          gteOFX, gteOFY, gteH, 2);   /* RTPS -> SXY2 */
 	}
 
 	gteMAC0 = mac0 = mac0flags(&flags, gteDQB + (s64)gteDQA * quotient);
@@ -664,7 +664,7 @@ static inline force_inline void gteRTPT(psxCP2Regs *regs, int shift, int lm)
 			if (pgxp_capture_on)
 				pgxp_note(fx, fy, fSX(v), fSY(v), sz3,
 				          ir1, ir2, sz3,
-				          gteOFX, gteOFY, h);
+				          gteOFX, gteOFY, h, v);  /* RTPT -> SXY0..2 */
 		}
 	}
 
@@ -1355,8 +1355,68 @@ static u32 pgxp_slot(u32 key)
 	return (key * 2654435761u) >> (32 - 15);
 }
 
+/* ---- ADDRESS PROVENANCE ------------------------------------------
+ * The screen coordinate is a fingerprint: two vertices can share one,
+ * which is our single largest source of lost depth. A RAM ADDRESS
+ * cannot be shared — the game stores each transform result to its own
+ * slot in the display list.
+ *
+ * So: remember which transform currently sits in each screen-FIFO slot,
+ * and when the game drains a slot with SWC2, record the destination
+ * address. The GPU side can then match a packet word to the exact
+ * transform that produced it, instead of guessing from the pixel.
+ *
+ * This does NOT need memory shadowing. Full PGXP instruments every load
+ * and store; we only need the one instruction that drains the GTE. */
+#define PGXP_ADDR_N 16384
+typedef struct { u32 addr, epoch; pgxp_ent e; } pgxp_addr_ent;
+static pgxp_addr_ent pgxp_atab[PGXP_ADDR_N];
+static pgxp_ent pgxp_fifo[4];      /* what is in SXY0..SXY2, SXYP */
+unsigned pgxp_stores, pgxp_addr_hit, pgxp_addr_miss;
+
+/* called from gteSWC2: the game just wrote CP2D register `creg` to
+ * `addr`. Only the screen-coordinate FIFO carries geometry we track. */
+void pgxp_store(u32 addr, int creg)
+{
+	pgxp_addr_ent *a;
+	int slot;
+	if (!pgxp_capture_on)
+		return;
+	if (creg < 12 || creg > 15)
+		return;                    /* not a screen coordinate */
+	slot = (creg == 15) ? 2 : creg - 12;   /* SXYP mirrors SXY2 */
+	if (!pgxp_fifo[slot].epoch)
+		return;
+	addr &= 0x1ffffc;
+	a = &pgxp_atab[(addr >> 2) & (PGXP_ADDR_N - 1)];
+	a->addr = addr;
+	a->epoch = pgxp_epoch;
+	a->e = pgxp_fifo[slot];
+	pgxp_stores++;
+}
+
+/* exact match by address: no collisions, no ambiguity, no guessing */
+int pgxp_addr_lookup(u32 addr, float *x, float *y, float *z,
+                     float *vx, float *vy, float *vz,
+                     float *ofx, float *ofy, float *h)
+{
+	pgxp_addr_ent *a;
+	addr &= 0x1ffffc;
+	a = &pgxp_atab[(addr >> 2) & (PGXP_ADDR_N - 1)];
+	if (!a->epoch || a->addr != addr ||
+	    pgxp_epoch - a->epoch > PGXP_SLACK) {
+		pgxp_addr_miss++;
+		return 0;
+	}
+	*x = a->e.x; *y = a->e.y; *z = a->e.z;
+	*vx = a->e.vx; *vy = a->e.vy; *vz = a->e.vz;
+	*ofx = a->e.ofx; *ofy = a->e.ofy; *h = a->e.h;
+	pgxp_addr_hit++;
+	return 1;
+}
+
 void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
-               s32 vx, s32 vy, s32 vz, s32 ofx, s32 ofy, s32 h)
+               s32 vx, s32 vy, s32 vz, s32 ofx, s32 ofy, s32 h, int slot)
 {
 	u32 key = pgxp_key((u32)sx, (u32)sy);
 	pgxp_ent *e = &pgxp_tab[pgxp_slot(key)];
@@ -1397,6 +1457,14 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 	e->ofy = (float)ofy / 65536.0f;
 	e->h = (float)h;
 	pgxp_writes++;
+	/* mirror into the FIFO slot this transform just landed in, and
+	 * shift as the hardware does, so a later SWC2 can find it */
+	if (slot == 2) {
+		pgxp_fifo[0] = pgxp_fifo[1];
+		pgxp_fifo[1] = pgxp_fifo[2];
+	}
+	if (slot >= 0 && slot < 3)
+		pgxp_fifo[slot] = *e;
 }
 
 /* returns 1 and fills x/y/z when this packed XY was produced by a

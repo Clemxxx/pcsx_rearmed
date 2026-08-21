@@ -1059,6 +1059,12 @@ OP(gteLWC2e_stall) {
 }
 
 OP(gteSWC2) {
+	/* The GTE is being drained into memory. That destination address is
+	 * the one durable identity a vertex has — unlike its screen
+	 * coordinate, no two vertices can share it. Record it so the GPU
+	 * side can match a packet word to the exact transform that made it.
+	 * See pgxp_store() in gte.c. */
+	pgxp_store(_oB_, _Rt_);
 	psxMemWrite32(regs_, _oB_, MFC2(&regs_->CP2, _Rt_));
 }
 

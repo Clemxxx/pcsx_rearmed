@@ -111,3 +111,11 @@ void gteMACtoRGB_nf(struct psxCP2Regs *regs);
 }
 #endif
 #endif
+/* Address provenance: pgxp_store() records where a GTE result was
+ * written; pgxp_addr_lookup() matches a display-list word back to the
+ * exact transform that produced it. Unlike the screen coordinate, an
+ * address is unique, so this has no ambiguity to resolve. */
+void pgxp_store(u32 addr, int creg);
+int pgxp_addr_lookup(u32 addr, float *x, float *y, float *z,
+                     float *vx, float *vy, float *vz,
+                     float *ofx, float *ofy, float *h);
