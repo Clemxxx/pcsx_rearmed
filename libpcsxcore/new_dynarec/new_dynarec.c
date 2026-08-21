@@ -3463,6 +3463,21 @@ static void load_assemble(struct compile_state *st, int i,
     return;
   is_dummy = dops[i].rt1 == 0 || tl != get_reg_w(i_regs->regmap, dops[i].rt1);
   reglist &= ~(1 << tl);
+  /* PGXP memory mode: a tagged word entering a register. Emitted
+   * BEFORE the load, and deliberately not given the loaded value --
+   * it copies the recorded value out of the shadow instead, and the
+   * store hook compares that against what is actually stored. That
+   * catches both a stale record and a register recomputed in between,
+   * for one call rather than two on the hottest path here. */
+  if (pgxp_mem_on && dops[i].opcode == 0x23 && !is_dummy) { // LW
+    u_int rl = reglist | (1u << addr_hr);
+    save_regs(rl);
+    if (addr_hr != 0)
+      emit_mov(addr_hr, 0);        // r0 = address
+    emit_movimm(dops[i].rt1, 1);   // r1 = destination MIPS register
+    emit_far_call(pgxp_mem_load);
+    restore_regs(rl);
+  }
   if (!c && !inline_slow_io) {
     addr_hr_io = addr_hr;
     jaddr = emit_fastpath_cmp_jump(st, i, i_regs, addr_hr,
@@ -3696,6 +3711,17 @@ static void store_assemble(struct compile_state *st, int i,
   assert(addr_hr >= 0);
   if(i_regs->regmap[HOST_CCREG]==CCREG) reglist&=~(1<<HOST_CCREG);
   reglist |= 1u << addr_hr;
+  /* PGXP memory mode: a tagged register landing in memory. Emitted
+   * before the store, where both the address and the value are still
+   * live and neither has been folded into a fastpath temporary. */
+  if (pgxp_mem_on && dops[i].opcode == 0x2B) { // SW
+    save_regs(reglist);
+    pass_args(addr_hr, tl);        // r0 = address, r1 = value
+    emit_mov(1, 2);                // r2 = value
+    emit_movimm(dops[i].rs2, 1);   // r1 = source MIPS register
+    emit_far_call(pgxp_mem_store);
+    restore_regs(reglist);
+  }
   if (!c && !inline_slow_io) {
     addr_hr_io = addr_hr;
     jaddr = emit_fastpath_cmp_jump(st, i, i_regs, addr_hr,
@@ -4279,6 +4305,25 @@ static void c2ls_assemble(struct compile_state *st, int i,
   if (dops[i].opcode==0x3a) { // SWC2
     cop2_get_dreg(copr,tl,-1);
     type=STOREW_STUB;
+    /* PGXP address provenance. The GPU side matches a display-list
+     * word back to the transform that produced it by the RAM address
+     * the word was fetched from, so something has to record that
+     * address when the game drains the GTE. SWC2 is compiled fully
+     * inline here -- there is no C handler on this path at all -- so
+     * the hook in psxinterpreter.c's gteSWC2 only ever ran on
+     * interpreted blocks, which is why the feature measured as
+     * broken. Emit the call ourselves.
+     *
+     * ar holds the guest address and tl the value about to be stored;
+     * both are still live here, before the fastpath compare. */
+    if (pgxp_addr_on) {
+      save_regs(reglist);
+      pass_args(ar, tl);      // r0 = address, r1 = value
+      emit_mov(1, 2);         // r2 = value
+      emit_movimm(copr, 1);   // r1 = CP2 data register number
+      emit_far_call(pgxp_store);
+      restore_regs(reglist);
+    }
   }
   else
     type=LOADW_STUB;
@@ -4347,6 +4392,17 @@ static void cop2_assemble(struct compile_state *st, int i, const struct regstat 
     signed char tl=get_reg_w(i_regs->regmap, dops[i].rt1);
     if(tl>=0&&dops[i].rt1!=0)
       cop2_get_dreg(copr,tl,temp);
+    /* PGXP memory mode: this is where a transform leaves the GTE and
+     * enters the general-purpose file. Both arguments are constants;
+     * the hook reads the CP2 register out of psxRegs itself. */
+    if (pgxp_mem_on && tl>=0 && dops[i].rt1!=0) {
+      u_int rl = get_host_reglist(i_regs->regmap) | (1u << tl);
+      save_regs(rl);
+      emit_movimm(dops[i].rt1, 0);   // r0 = destination MIPS register
+      emit_movimm(copr, 1);          // r1 = CP2 data register
+      emit_far_call(pgxp_mfc2);
+      restore_regs(rl);
+    }
   }
   else if (dops[i].opcode2==4) { // MTC2
     signed char sl=get_reg(i_regs->regmap,dops[i].rs1);

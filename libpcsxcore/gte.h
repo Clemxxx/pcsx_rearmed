@@ -107,15 +107,31 @@ void gteINTPL_part_shift_nf(struct psxCP2Regs *regs);
 void gteMACtoRGB(struct psxCP2Regs *regs);
 void gteMACtoRGB_nf(struct psxCP2Regs *regs);
 
-#ifdef __cplusplus
-}
-#endif
-#endif
 /* Address provenance: pgxp_store() records where a GTE result was
  * written; pgxp_addr_lookup() matches a display-list word back to the
  * exact transform that produced it. Unlike the screen coordinate, an
- * address is unique, so this has no ambiguity to resolve. */
+ * address is unique, so this has no ambiguity to resolve.
+ *
+ * pgxp_shadow_alloc() must be called before either is useful; until it
+ * is, pgxp_store() is a no-op and every lookup misses. It is also what
+ * the recompiler tests to decide whether to emit the SWC2 hook, so it
+ * has to run during GPUinit, before any game code is compiled. */
+extern int pgxp_addr_on;
+/* memory mode: propagate the tag through mfc2 / lw / sw so it
+ * survives the copy from the GTE work buffer into the display list.
+ * Read by the recompiler at block-compile time, same as above. */
+extern int pgxp_mem_on;
+int  pgxp_mem_enable(void);
+void pgxp_mfc2(u32 rt, u32 creg);
+void pgxp_mem_load(u32 addr, u32 rt);
+void pgxp_mem_store(u32 addr, u32 rt, u32 val);
+int  pgxp_shadow_alloc(void);
 void pgxp_store(u32 addr, int creg, u32 val);
 int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
                      float *vx, float *vy, float *vz,
                      float *ofx, float *ofy, float *h);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

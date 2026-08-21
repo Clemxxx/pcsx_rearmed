@@ -23,6 +23,7 @@
 * GTE functions.
 */
 
+#include <stdlib.h>
 #include "gte.h"
 #include "gte_arm.h"
 #include "psxmem.h"
@@ -1368,64 +1369,219 @@ static u32 pgxp_slot(u32 key)
  *
  * This does NOT need memory shadowing. Full PGXP instruments every load
  * and store; we only need the one instruction that drains the GTE. */
-#define PGXP_ADDR_N 16384
-/* `val` is a COPY of the word we saw written to this address. Real
- * PGXP carries the same field and compares it before trusting a tag —
- * it is the whole safety model, not an optimisation. Without it, a
- * display-list slot rewritten by a plain `sw` (which we never see,
- * because we only hook SWC2) keeps its OLD transform, and the next
- * packet at that address inherits a stale depth. The whole primitive
- * then gets a coherent-but-wrong depth, which is precisely the
- * scattering we measured: self-consistent per polygon, badly placed. */
-typedef struct { u32 addr, epoch, val; pgxp_ent e; } pgxp_addr_ent;
-static pgxp_addr_ent pgxp_atab[PGXP_ADDR_N];
-static pgxp_ent pgxp_fifo[4];      /* what is in SXY0..SXY2, SXYP */
-unsigned pgxp_stores, pgxp_addr_hit, pgxp_addr_miss, pgxp_addr_stale;
+/* A real shadow, one slot per 32-bit word of PS1 RAM, exactly as PGXP
+ * does it. The old table was 16384 entries indexed
+ * (addr >> 2) & 16383 over a 512K-word RAM, so any two addresses 64 KB
+ * apart aliased onto each other.
+ *
+ * The transform itself is NOT stored inline -- 40 bytes per RAM word
+ * would be 21 MB. Instead the shadow holds a sequence number into a
+ * ring of the transforms we captured, which costs 8 bytes per word and
+ * self-invalidates: once the ring has wrapped past a sequence number,
+ * that transform is provably gone and the lookup fails cleanly rather
+ * than reading whatever recycled the slot. */
+#define PGXP_RAM_WORDS  (2*1024*1024/4)
+#define PGXP_POOL_N     65536          /* power of two; ~1 frame of MGS */
 
-/* called from gteSWC2: the game just wrote CP2D register `creg` to
- * `addr`. Only the screen-coordinate FIFO carries geometry we track. */
+/* what a consumer actually needs back; no key/amb, those belong to the
+ * screen-keyed table only */
+typedef struct {
+	u32 epoch;
+	float x, y, z;
+	float vx, vy, vz;
+	float ofx, ofy, h;
+} pgxp_xf;
+
+typedef struct { u32 val, seq; } pgxp_shadow_ent;
+
+static pgxp_xf         *pgxp_pool;      /* PGXP_POOL_N, lazily allocated */
+static pgxp_shadow_ent *pgxp_shadow;    /* PGXP_RAM_WORDS, ditto */
+static u32 pgxp_pool_head = 1;          /* next seq; 0 means "no entry" */
+static u32 pgxp_fifo_seq[4];            /* seq of what is in SXY0..2/SXYP */
+
+unsigned pgxp_stores, pgxp_addr_hit, pgxp_addr_miss, pgxp_addr_stale;
+unsigned pgxp_addr_evict, pgxp_addr_old;
+/* The recompiler reads this at block-compile time to decide whether to
+ * emit the SWC2 hook, so it must be settled during GPUinit, before any
+ * game code is compiled, and never change afterwards. */
+int pgxp_addr_on;
+
+/* Called once, from the GPU plugin, when address provenance is enabled.
+ * ~6.8 MB, so it is not paid for unless the feature is on. Returns 0 on
+ * failure, and the feature simply stays off. */
+int pgxp_shadow_alloc(void)
+{
+	if (pgxp_shadow && pgxp_pool)
+		return 1;
+	if (!pgxp_shadow)
+		pgxp_shadow = calloc(PGXP_RAM_WORDS, sizeof(*pgxp_shadow));
+	if (!pgxp_pool)
+		pgxp_pool = calloc(PGXP_POOL_N, sizeof(*pgxp_pool));
+	if (!pgxp_shadow || !pgxp_pool) {
+		free(pgxp_shadow); pgxp_shadow = NULL;
+		free(pgxp_pool);   pgxp_pool = NULL;
+		return 0;
+	}
+	pgxp_addr_on = 1;
+	return 1;
+}
+
+/* RAM only. The 8 MB region at the bottom of each segment mirrors the
+ * 2 MB of real RAM; scratchpad (0x1f800000) and I/O must NOT be folded
+ * into it, or a scratchpad write would corrupt a RAM slot. */
+static int pgxp_ram_word(u32 addr, u32 *word)
+{
+	u32 pa = addr & 0x1fffffff;
+	if (pa >= 0x00800000)
+		return 0;
+	*word = (pa & 0x1ffffc) >> 2;
+	return 1;
+}
+
+/* called when the game writes CP2 data register `creg` to `addr` --
+ * from the interpreter's gteSWC2 AND from the code the recompiler
+ * emits for SWC2 (see c2ls_assemble). Only the screen-coordinate FIFO
+ * carries geometry we track. */
 void pgxp_store(u32 addr, int creg, u32 val)
 {
-	pgxp_addr_ent *a;
+	u32 w;
 	int slot;
-	if (!pgxp_capture_on)
+	if (!pgxp_shadow)
 		return;
 	if (creg < 12 || creg > 15)
 		return;                    /* not a screen coordinate */
 	slot = (creg == 15) ? 2 : creg - 12;   /* SXYP mirrors SXY2 */
-	if (!pgxp_fifo[slot].epoch)
+	if (!pgxp_fifo_seq[slot])
 		return;
-	addr &= 0x1ffffc;
-	a = &pgxp_atab[(addr >> 2) & (PGXP_ADDR_N - 1)];
-	a->addr = addr;
-	a->epoch = pgxp_epoch;
-	a->val = val;              /* what memory held when we recorded it */
-	a->e = pgxp_fifo[slot];
+	if (!pgxp_ram_word(addr, &w))
+		return;
+	pgxp_shadow[w].val = val;  /* what memory held when we recorded it */
+	pgxp_shadow[w].seq = pgxp_fifo_seq[slot];
 	pgxp_stores++;
 }
 
+/* ---- MEMORY MODE ------------------------------------------------
+ * SWC2 alone recovers almost nothing in practice: measured on MGS,
+ * only 3016 of 334980 display-list vertices came from an address the
+ * game had written with swc2, against 376485 swc2 stores in the same
+ * window. The game drains the GTE into a work buffer and assembles
+ * the packets with ordinary loads and stores, so the tag has to
+ * survive that copy. That is what PGXP's memory mode is for.
+ *
+ * A shadow entry per general-purpose register, moved by the same
+ * three instructions the data moves through:
+ *   mfc2 rt, $12..15  -- a transform enters a register
+ *   lw   rt, off(rs)  -- a tagged word enters a register
+ *   sw   rt, off(rs)  -- a tagged register lands in memory
+ *
+ * The load hook deliberately does NOT read the loaded value. It copies
+ * the RECORDED value out of the shadow, and the store hook compares
+ * that against the value actually being stored. If our record was out
+ * of date, or if the register was recomputed in between, the two
+ * disagree and the tag is dropped -- which is the same validation rule
+ * that protects everything else here, reused to save a second call in
+ * the hottest path in the recompiler. */
+static pgxp_shadow_ent pgxp_gpr[32];
+unsigned pgxp_mloads, pgxp_mstores, pgxp_mdrops;
+int pgxp_mem_on;
+
+/* mfc2 rt, $creg: a GTE result enters the general-purpose file. Only
+ * the screen-coordinate registers carry geometry we track. */
+void pgxp_mfc2(u32 rt, u32 creg)
+{
+	if (!pgxp_shadow || rt >= 32)
+		return;
+	if (creg >= 12 && creg <= 15) {
+		int slot = (creg == 15) ? 2 : (int)creg - 12;
+		pgxp_gpr[rt].seq = pgxp_fifo_seq[slot];
+		pgxp_gpr[rt].val = psxRegs.CP2D.r[creg];
+	} else {
+		pgxp_gpr[rt].seq = 0;
+	}
+}
+
+void pgxp_mem_load(u32 addr, u32 rt)
+{
+	u32 w;
+	if (!pgxp_shadow || rt >= 32)
+		return;
+	if (!pgxp_ram_word(addr, &w)) {
+		pgxp_gpr[rt].seq = 0;
+		return;
+	}
+	pgxp_gpr[rt] = pgxp_shadow[w];
+	if (pgxp_gpr[rt].seq)
+		pgxp_mloads++;
+}
+
+void pgxp_mem_store(u32 addr, u32 rt, u32 val)
+{
+	u32 w;
+	if (!pgxp_shadow || rt >= 32)
+		return;
+	if (!pgxp_ram_word(addr, &w))
+		return;
+	if (pgxp_gpr[rt].seq && pgxp_gpr[rt].val == val) {
+		pgxp_shadow[w].val = val;
+		pgxp_shadow[w].seq = pgxp_gpr[rt].seq;
+		pgxp_mstores++;
+	} else if (pgxp_shadow[w].seq) {
+		/* untracked data now lives at this address: drop the old tag
+		 * rather than leave it to be rejected later, so that a miss
+		 * reads as a miss and not as staleness */
+		pgxp_shadow[w].seq = 0;
+		pgxp_mdrops++;
+	}
+}
+
+/* memory mode implies the address path; both need the same shadow */
+int pgxp_mem_enable(void)
+{
+	if (!pgxp_shadow_alloc())
+		return 0;
+	pgxp_mem_on = 1;
+	return 1;
+}
 /* exact match by address: no collisions, no ambiguity, no guessing */
 int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
                      float *vx, float *vy, float *vz,
                      float *ofx, float *ofy, float *h)
 {
-	pgxp_addr_ent *a;
-	addr &= 0x1ffffc;
-	a = &pgxp_atab[(addr >> 2) & (PGXP_ADDR_N - 1)];
-	if (!a->epoch || a->addr != addr ||
-	    pgxp_epoch - a->epoch > PGXP_SLACK) {
+	pgxp_shadow_ent *s;
+	const pgxp_xf *e;
+	u32 w, seq;
+	if (!pgxp_shadow || !pgxp_ram_word(addr, &w)) {
 		pgxp_addr_miss++;
 		return 0;
 	}
-	if (a->val != val) {
+	s = &pgxp_shadow[w];
+	seq = s->seq;
+	if (!seq) {
+		pgxp_addr_miss++;
+		return 0;
+	}
+	if (s->val != val) {
 		/* memory changed behind our back: this word is no longer the
-		 * one we recorded, so the transform does not describe it */
+		 * one we recorded, so the transform does not describe it.
+		 * This is PGXP's value-validation rule and it is the whole
+		 * safety model -- without it a word rewritten by a path we do
+		 * not hook inherits someone else's depth. */
 		pgxp_addr_stale++;
 		return 0;
 	}
-	*x = a->e.x; *y = a->e.y; *z = a->e.z;
-	*vx = a->e.vx; *vy = a->e.vy; *vz = a->e.vz;
-	*ofx = a->e.ofx; *ofy = a->e.ofy; *h = a->e.h;
+	if (pgxp_pool_head - seq > PGXP_POOL_N) {
+		/* the ring wrapped past it: the transform is provably gone */
+		pgxp_addr_evict++;
+		return 0;
+	}
+	e = &pgxp_pool[seq & (PGXP_POOL_N - 1)];
+	if (pgxp_epoch - e->epoch > PGXP_SLACK) {
+		pgxp_addr_old++;
+		return 0;
+	}
+	*x = e->x; *y = e->y; *z = e->z;
+	*vx = e->vx; *vy = e->vy; *vz = e->vz;
+	*ofx = e->ofx; *ofy = e->ofy; *h = e->h;
 	pgxp_addr_hit++;
 	return 1;
 }
@@ -1476,12 +1632,25 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 		f.ofy = (float)ofy / 65536.0f;
 		f.h = (float)h;
 		f.amb = 0;
-		if (slot == 3) {
-			pgxp_fifo[0] = pgxp_fifo[1];
-			pgxp_fifo[1] = pgxp_fifo[2];
-			pgxp_fifo[2] = f;
-		} else if (slot >= 0 && slot < 3) {
-			pgxp_fifo[slot] = f;
+		/* Append the transform to the ring, and remember WHICH ring slot
+		 * each screen-FIFO register now refers to. The register file
+		 * holds an integer word; we hold the float transform that
+		 * produced it, and the sequence number is the link between the
+		 * two that stays honest after the ring wraps. */
+		if (pgxp_pool) {
+			u32 seq = pgxp_pool_head++;
+			pgxp_xf *xf = &pgxp_pool[seq & (PGXP_POOL_N - 1)];
+			xf->epoch = f.epoch;
+			xf->x = f.x;   xf->y = f.y;   xf->z = f.z;
+			xf->vx = f.vx; xf->vy = f.vy; xf->vz = f.vz;
+			xf->ofx = f.ofx; xf->ofy = f.ofy; xf->h = f.h;
+			if (slot == 3) {
+				pgxp_fifo_seq[0] = pgxp_fifo_seq[1];
+				pgxp_fifo_seq[1] = pgxp_fifo_seq[2];
+				pgxp_fifo_seq[2] = seq;
+			} else if (slot >= 0 && slot < 3) {
+				pgxp_fifo_seq[slot] = seq;
+			}
 		}
 	}
 	if (e->key == key && e->epoch == pgxp_epoch) {
