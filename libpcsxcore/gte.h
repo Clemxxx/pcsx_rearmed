@@ -66,6 +66,13 @@ void MTC2(struct psxCP2Regs *regs, u32 value, int reg);
 void CTC2(struct psxCP2Regs *regs, u32 value, int reg);
 
 typedef void (gte_handler)(psxCP2Regs *regs, u32 code);
+
+/* PGXP-style geometry capture, implemented in gte.c. When enabled,
+ * RTPS/RTPT keep the sub-pixel projection they would otherwise discard.
+ * The recompiler reads this to decide whether it may substitute the asm
+ * fast paths for those two ops (see assem_arm.c). */
+extern int pgxp_capture_on;
+int pgxp_lookup(u32 packed, float *x, float *y, float *z);
 gte_handler *gteGetHandler(u32 code);
 gte_handler *gteGetHandler_nf(u32 code);
 

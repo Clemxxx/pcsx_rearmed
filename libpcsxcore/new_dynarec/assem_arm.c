@@ -2058,8 +2058,15 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
         break;
       }
 #endif // HAVE_ARMV5
+      /* The asm fast paths for RTPS/RTPT do not keep the sub-pixel
+       * projection that the PGXP-style capture in gte.c needs (they are
+       * the ">> 16" in hand-written form), so with capture on, fall
+       * back to the C handler for exactly these two ops. Everything
+       * else keeps its asm. Read at block-compile time: the flag is set
+       * during GPUinit, before any game code is compiled, and never
+       * changes afterwards. */
       case GTEOP_RTPS:
-        if (shift && !lm) {
+        if (shift && !lm && !pgxp_capture_on) {
 #if defined(__ARM_NEON__)
           handler = need_flags ? gteRTPS_sf1lm0_neon : gteRTPS_sf1lm0_nf_neon;
 #elif defined(HAVE_ARMV5)
@@ -2068,7 +2075,7 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
         }
         goto do_handler;
       case GTEOP_RTPT:
-        if (shift && !lm) {
+        if (shift && !lm && !pgxp_capture_on) {
 #if defined(__ARM_NEON__)
           handler = need_flags ? gteRTPT_sf1lm0_neon : gteRTPT_sf1lm0_nf_neon;
 #elif defined(HAVE_ARMV5)
