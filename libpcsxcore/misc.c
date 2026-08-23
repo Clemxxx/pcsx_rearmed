@@ -666,7 +666,20 @@ fail_io:
 
 static void *zlib_open(const char *name, const char *mode)
 {
-	return gzopen(name, mode);
+	/* write at deflate level 1: the level-6 default costs multiple
+	 * seconds of pure CPU per ~6MB state on an 804MHz ARM11 and
+	 * dominates the save freeze; level 1 compresses ~3x faster and
+	 * PS1 RAM still shrinks fine. The format is unchanged — states
+	 * written at any level load anywhere. */
+	if (mode[0] == 'w')
+		mode = "wb1";
+	gzFile f = gzopen(name, mode);
+	/* zlib's default 8KB stream buffer turns a state into thousands of
+	 * tiny SD writes (measured 0.22MB/s vs 2MB/s for large blocks on
+	 * the 3DS). One big buffer, most of the freeze gone. */
+	if (f)
+		gzbuffer(f, 512 * 1024);
+	return f;
 }
 
 static int zlib_read(void *file, void *buf, u32 len)
