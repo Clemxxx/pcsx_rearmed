@@ -1440,9 +1440,51 @@ unsigned pgxp_writes, pgxp_amb, pgxp_stale;
 unsigned pgxp_m_empty, pgxp_m_key, pgxp_m_amb;
 
 /* called once per frame by the GPU frontend */
+/* GTE truth stream: every projection the GTE performs, recorded at
+ * computation time -- screen x, y (post-limG, what the packet will
+ * carry) and depth. This is the reference no courier bug can touch:
+ * decoded vertices are diffed against it offline (EMUCTL 35 arms,
+ * sdmc:/psxgpu/truth.bin lands, 3 vblank windows to straddle the
+ * game's compute-then-DMA skew). */
+int pgxp_truth_req;
+#define PGXP_TRUTH_MAX 65536
+typedef struct { float x, y, z; } pgxp_truth_rec;
+static pgxp_truth_rec *pgxp_truth_buf;
+static int pgxp_truth_n = -1;
+static int pgxp_truth_frames;
+
+static void pgxp_truth_note(float x, float y, float z)
+{
+	if (pgxp_truth_n >= 0 && pgxp_truth_n < PGXP_TRUTH_MAX) {
+		pgxp_truth_buf[pgxp_truth_n].x = x;
+		pgxp_truth_buf[pgxp_truth_n].y = y;
+		pgxp_truth_buf[pgxp_truth_n].z = z;
+		pgxp_truth_n++;
+	}
+}
+
 void pgxp_frame(void)
 {
 	pgxp_epoch++;
+	if (pgxp_truth_req && pgxp_truth_n < 0) {
+		pgxp_truth_req = 0;
+		if (!pgxp_truth_buf)
+			pgxp_truth_buf = malloc(PGXP_TRUTH_MAX * sizeof(pgxp_truth_rec));
+		if (pgxp_truth_buf) {
+			pgxp_truth_n = 0;
+			pgxp_truth_frames = 0;
+		}
+	} else if (pgxp_truth_n >= 0 && ++pgxp_truth_frames >= 3) {
+		if (pgxp_truth_n > 0) {
+			FILE *f = fopen("sdmc:/psxgpu/truth.bin", "wb");
+			if (f) {
+				fwrite(pgxp_truth_buf, sizeof(pgxp_truth_rec),
+				       pgxp_truth_n, f);
+				fclose(f);
+			}
+		}
+		pgxp_truth_n = -1;
+	}
 }
 
 static u32 pgxp_key(u32 sx, u32 sy)
@@ -1502,7 +1544,7 @@ static u32 pgxp_pool_head = 1;          /* next seq; 0 means "no entry" */
 static u32 pgxp_fifo_seq[4];            /* seq of what is in SXY0..2/SXYP */
 
 unsigned pgxp_stores, pgxp_addr_hit, pgxp_addr_miss, pgxp_addr_stale;
-unsigned pgxp_addr_evict, pgxp_addr_old;
+unsigned pgxp_addr_evict, pgxp_addr_old, pgxp_addr_pos;
 /* The recompiler reads this at block-compile time to decide whether to
  * emit the SWC2 hook, so it must be settled during GPUinit, before any
  * game code is compiled, and never change afterwards. */
@@ -1698,6 +1740,23 @@ int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
 		pgxp_addr_old++;
 		return 0;
 	}
+	{
+		/* THE LAST INVARIANT: the linked transform's own screen
+		 * position must BE the packet's. val==word only proves the
+		 * address holds this value -- it says nothing about whether
+		 * the linked transform produced it: a register rebuilt after
+		 * MFC2 stores its own value under someone else's seq, and
+		 * every earlier check passes. Measured before this gate:
+		 * floor pixels carrying w=1919 from a transform that
+		 * projected to a different pixel entirely. */
+		s32 px = ((s32)((val & 0x7FF) << 21)) >> 21;
+		s32 py = ((s32)(((val >> 16) & 0x7FF) << 21)) >> 21;
+		float dx = e->x - (float)px, dy = e->y - (float)py;
+		if (dx < -1.5f || dx > 1.5f || dy < -1.5f || dy > 1.5f) {
+			pgxp_addr_pos++;
+			return 0;
+		}
+	}
 	*x = e->x; *y = e->y; *z = e->z;
 	*vx = e->vx; *vy = e->vy; *vz = e->vz;
 	*ofx = e->ofx; *ofy = e->ofy; *h = e->h;
@@ -1751,6 +1810,7 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 		f.ofy = (float)ofy / 65536.0f;
 		f.h = (float)h;
 		f.amb = 0;
+		pgxp_truth_note(f.x, f.y, f.z);
 		/* Append the transform to the ring, and remember WHICH ring slot
 		 * each screen-FIFO register now refers to. The register file
 		 * holds an integer word; we hold the float transform that
@@ -1793,8 +1853,21 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 		e->amb = 0;
 	}
 	e->key = key;
-	e->x = (float)fx / 65536.0f;   /* sub-pixel screen position */
-	e->y = (float)fy / 65536.0f;
+	/* the SATURATED sub-pixel position (f.x/f.y), never the raw
+	 * projection: rebuilding from fx/fy here skipped the limG clamp
+	 * that every other path applies, so a vertex near the range edge
+	 * could pass validation carrying a position hundreds of units
+	 * off-screen -- the exact "validates, then flings the triangle"
+	 * failure this file already documents. Also four fewer converts. */
+	{
+		float sx_f = (float)fx / 65536.0f, sy_f = (float)fy / 65536.0f;
+		if (sx_f < -1024.0f) sx_f = -1024.0f;
+		if (sx_f > 1023.0f) sx_f = 1023.0f;
+		if (sy_f < -1024.0f) sy_f = -1024.0f;
+		if (sy_f > 1023.0f) sy_f = 1023.0f;
+		e->x = sx_f;
+		e->y = sy_f;
+	}
 	e->z = z;                      /* view depth, GTE units */
 	e->vx = (float)vx;             /* view space, same units as z */
 	e->vy = (float)vy;
