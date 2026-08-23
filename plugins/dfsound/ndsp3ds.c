@@ -52,6 +52,73 @@ float snd3ds_rate;
 /* kill switch, set by the frontend before SPUinit (sdmc:/psxgpu/sound.off) */
 int snd3ds_disable;
 int snd3ds_target; /* current adaptive cushion, for telemetry */
+int snd3ds_speed_x100 = 100; /* estimated emulation speed, for telemetry */
+
+/* ---- rate-following ("pitch-follow"): the emulator produces samples
+ * in EMULATED time, so at 83% speed it makes 83% of real-time audio and
+ * no queue can survive that. Play the samples at the rate they arrive:
+ * the DSP resamples anyway (44100 -> 32728.5 native), so a different
+ * target rate costs zero ARM11 cycles. Music sags in pitch when the
+ * game is slow -- the "real hardware under load" sound -- and never
+ * gaps. At full speed the estimator reads ~1.0 and behaviour is
+ * today's +-trim around 44100. docs/AUDIO_STUTTER_PLAN.md is the
+ * derivation; the floor comes from sdmc:/psxgpu/pitchfollow.cfg and
+ * pitchfollow.off pins it to 0.99 (the old behaviour) for A/B. */
+#define SPD_RING 32              /* ~0.53s at 60 feeds/s: long enough
+                                  * that a 10th-frame spike moves the
+                                  * mean by its weight, not a warble */
+#define TICKS8_PER_S 1047312.0f  /* 268111856 / 256 */
+static u32 spd_tick[SPD_RING];   /* svcGetSystemTick() >> 8 */
+static u16 spd_fr[SPD_RING];
+static int spd_pos, spd_n;
+static float spd_est = 1.0f;
+static float rate_floor = 0.65f;
+
+/* ---- per-feed event ring: the authoritative continuity record. The
+ * .wav capture mirrors what is PRODUCED (continuous by construction);
+ * only this ring shows what the DSP was given and when. Written next
+ * to the capture as snd_ring.txt. */
+struct snd_ev { u32 us; u16 frames; u8 q; u8 flags; float rate; };
+#define SND_EV_UNDER   1
+#define SND_EV_DROP    2
+#define SND_EV_SILENCE 4
+#define SND_RING_N 4096          /* ~68s at 60 feeds/s, 48KB heap */
+static struct snd_ev *snd_ring;
+static unsigned snd_ring_pos;
+
+static void ring_note(int frames, int q, int flags)
+{
+	struct snd_ev *e;
+	if (!snd_ring)
+		return;
+	e = &snd_ring[snd_ring_pos++ & (SND_RING_N - 1)];
+	e->us = (u32)(svcGetSystemTick() / 268); /* ~1us units */
+	e->frames = (u16)frames;
+	e->q = (u8)q;
+	e->flags = (u8)flags;
+	e->rate = cur_rate;
+}
+
+int snd3ds_ring_dump(const char *path)
+{
+	FILE *f;
+	unsigned i, first, n;
+	if (!snd_ring)
+		return -1;
+	n = snd_ring_pos < SND_RING_N ? snd_ring_pos : SND_RING_N;
+	first = snd_ring_pos - n;
+	f = fopen(path, "wb");
+	if (!f)
+		return -1;
+	fprintf(f, "us frames q flags rate\n");
+	for (i = 0; i < n; i++) {
+		struct snd_ev *e = &snd_ring[(first + i) & (SND_RING_N - 1)];
+		fprintf(f, "%lu %u %u %u %.1f\n", (unsigned long)e->us,
+			e->frames, e->q, e->flags, e->rate);
+	}
+	fclose(f);
+	return (int)n;
+}
 
 /* ---- capture: mirror what is fed to the DSP into RAM, written out
  * as a .wav. The only objective way to check the mix remotely (and
@@ -100,6 +167,10 @@ int snd3ds_capture_write(const char *path)
 	fwrite(&data_bytes, 4, 1, f);
 	fwrite(cap_buf, 1, data_bytes, f);
 	fclose(f);
+	/* the continuity record rides along: the wav shows what played,
+	 * the ring shows when each feed happened, at what rate, and every
+	 * underrun/drop/silence event */
+	snd3ds_ring_dump("sdmc:/psxgpu/snd_ring.txt");
 	return cap_frames;
 }
 
@@ -111,6 +182,54 @@ static int queued_count(void)
 		    wbuf[i].status == NDSP_WBUF_PLAYING)
 			n++;
 	return n;
+}
+
+/* ---- capture v2: OUTPUT-timeline. The old capture mirrored what was
+ * produced, which is continuous by construction and therefore proves
+ * nothing about stutter. This resamples each block by cur_rate/44100
+ * (what the DSP actually does) and appends the silence gaps too, so
+ * the wav is what the speaker played: gaps appear as gaps, a slow
+ * game appears as pitch. Cost is paid only while a capture is armed. */
+static void cap_append(const s16 *src, int frames)
+{
+	float step = cur_rate / BASE_RATE;
+	float pos = 0.0f;
+	if (!cap_on || frames < 2)
+		return;
+	while (cap_frames < CAP_MAX_FRAMES) {
+		int i = (int)pos;
+		float fr = pos - (float)i;
+		const s16 *a;
+		s16 *d;
+		if (i >= frames - 1)
+			break;
+		a = src + (size_t)i * 2;
+		d = cap_buf + (size_t)cap_frames * 2;
+		d[0] = (s16)((float)a[0] + ((float)a[2] - (float)a[0]) * fr);
+		d[1] = (s16)((float)a[1] + ((float)a[3] - (float)a[1]) * fr);
+		cap_frames++;
+		pos += step;
+	}
+	if (cap_frames >= CAP_MAX_FRAMES)
+		cap_on = 0;
+}
+
+static void cap_append_silence(int frames)
+{
+	int n, room;
+	if (!cap_on)
+		return;
+	n = (int)((float)frames * BASE_RATE / cur_rate);
+	room = CAP_MAX_FRAMES - cap_frames;
+	if (n > room)
+		n = room;
+	if (n > 0) {
+		memset(cap_buf + (size_t)cap_frames * 2, 0,
+		       (size_t)n * 2 * sizeof(s16));
+		cap_frames += n;
+	}
+	if (cap_frames >= CAP_MAX_FRAMES)
+		cap_on = 0;
 }
 
 static int ndsp3ds_init(void)
@@ -145,6 +264,27 @@ static int ndsp3ds_init(void)
 	need_prime = target_queue - 1; /* silence ahead of the first feed */
 	cur_rate = BASE_RATE;
 	snd3ds_rate = cur_rate;
+	{ /* pitch-follow floor, read once at init (boot path, never the
+	   * frame path). pitchfollow.cfg = one float 0.50..0.99;
+	   * pitchfollow.off pins 0.99 = the old +-trim behaviour, for A/B. */
+		FILE *f = fopen("sdmc:/psxgpu/pitchfollow.cfg", "rb");
+		if (f) {
+			float v = 0.0f;
+			if (fscanf(f, "%f", &v) == 1 && v >= 0.50f && v <= 0.99f)
+				rate_floor = v;
+			fclose(f);
+		}
+		f = fopen("sdmc:/psxgpu/pitchfollow.off", "rb");
+		if (f) {
+			fclose(f);
+			rate_floor = 0.99f;
+		}
+	}
+	if (!snd_ring)
+		snd_ring = malloc(SND_RING_N * sizeof(struct snd_ev));
+	snd_ring_pos = 0;
+	spd_pos = spd_n = 0;
+	spd_est = 1.0f;
 	inited = 1;
 	return 0;
 }
@@ -165,6 +305,8 @@ static void queue_silence(int frames)
 	b->nsamples = (u32)frames;
 	ndspChnWaveBufAdd(NDSP_CHN, b);
 	next_buf = (next_buf + 1) % NBUF;
+	cap_append_silence(frames);
+	ring_note(frames, queued_count(), SND_EV_SILENCE);
 }
 
 static void ndsp3ds_finish(void)
@@ -193,7 +335,7 @@ static void ndsp3ds_feed(void *data, int bytes)
 {
 	ndspWaveBuf *b;
 	s16 *slot;
-	int frames, q;
+	int frames, q, evflags = 0;
 
 	if (!inited || bytes <= 0)
 		return;
@@ -202,9 +344,48 @@ static void ndsp3ds_feed(void *data, int bytes)
 	if (frames > MAX_FRAMES)
 		frames = MAX_FRAMES;
 
+	{ /* speed estimator: the SPU makes samples in EMULATED time, so
+	   * frames-per-wall-second IS the emulation speed. Counted before
+	   * the overrun drop below -- a dropped feed was still produced.
+	   * A >250ms gap since the last feed (pause, menu, savestate,
+	   * stall) clears the window and holds the estimate: the driver
+	   * self-heals with no frontend notification needed. */
+		u32 now = (u32)(svcGetSystemTick() >> 8);
+		if (spd_n > 0) {
+			u32 prev = spd_tick[(spd_pos + SPD_RING - 1) % SPD_RING];
+			if ((u32)(now - prev) > (u32)(TICKS8_PER_S / 4.0f))
+				spd_n = 0;
+		}
+		spd_tick[spd_pos] = now;
+		spd_fr[spd_pos] = (u16)frames;
+		spd_pos = (spd_pos + 1) % SPD_RING;
+		if (spd_n < SPD_RING)
+			spd_n++;
+		if (spd_n >= 8) { /* ~130ms of history before trusting it */
+			int oldest = (spd_pos + SPD_RING - spd_n) % SPD_RING;
+			u32 dt = now - spd_tick[oldest];
+			u32 sum = 0;
+			int i, idx = oldest;
+			for (i = 1; i < spd_n; i++) {
+				/* the oldest entry's frames predate its tick */
+				idx = (idx + 1) % SPD_RING;
+				sum += spd_fr[idx];
+			}
+			if (dt > 0) {
+				float est = (float)sum * TICKS8_PER_S /
+					    ((float)dt * BASE_RATE);
+				if (est < 0.30f) est = 0.30f;
+				if (est > 1.10f) est = 1.10f;
+				spd_est = est;
+				snd3ds_speed_x100 = (int)(spd_est * 100.0f + 0.5f);
+			}
+		}
+	}
+
 	if (queued_count() == 0) {
 		if (!need_prime) {
 			snd3ds_underruns++; /* DSP ran dry: real gap */
+			evflags |= SND_EV_UNDER;
 			if (target_queue < QUEUE_MAX)
 				target_queue++; /* buy more cushion */
 			calm_feeds = 0;
@@ -223,6 +404,7 @@ static void ndsp3ds_feed(void *data, int bytes)
 	b = &wbuf[next_buf];
 	if (b->status != NDSP_WBUF_FREE && b->status != NDSP_WBUF_DONE) {
 		snd3ds_overruns++; /* queue full: drop rather than block */
+		ring_note(frames, queued_count(), evflags | SND_EV_DROP);
 		return;
 	}
 
@@ -230,17 +412,7 @@ static void ndsp3ds_feed(void *data, int bytes)
 	memcpy(slot, data, (size_t)frames * 2 * sizeof(s16));
 	DSP_FlushDataCache(slot, (u32)frames * 2 * sizeof(s16));
 
-	if (cap_on) { /* mirror the exact stream for offline inspection */
-		int room = CAP_MAX_FRAMES - cap_frames;
-		int n = frames < room ? frames : room;
-		if (n > 0) {
-			memcpy(cap_buf + (size_t)cap_frames * 2, data,
-			       (size_t)n * 2 * sizeof(s16));
-			cap_frames += n;
-		}
-		if (cap_frames >= CAP_MAX_FRAMES)
-			cap_on = 0;
-	}
+	cap_append((const s16 *)data, frames); /* output-timeline capture */
 
 	memset(b, 0, sizeof(*b));
 	b->data_vaddr = slot;
@@ -248,23 +420,47 @@ static void ndsp3ds_feed(void *data, int bytes)
 	ndspChnWaveBufAdd(NDSP_CHN, b);
 	next_buf = (next_buf + 1) % NBUF;
 
-	/* audio-clock sync: nudge playback rate toward the target depth.
-	 * q is sampled after the add, so the just-queued buffer counts. */
+	/* Rate-following: the estimator sets the operating point (play the
+	 * samples at the rate they actually arrive), the queue error only
+	 * trims residual bias. q is sampled after the add, so the
+	 * just-queued buffer counts. Falling is quick -- reacting late
+	 * costs a dropout -- rising is slower (rising early costs
+	 * nothing), and q<=1 may step 2% at once: a fast pitch dip beats
+	 * a hole. At full speed spd_est reads ~1.0 and this degenerates
+	 * to the old +-trim around 44100. */
 	q = queued_count();
 	{
 		float err = (float)(q - target_queue); /* + = too much latency */
-		float want = BASE_RATE * (1.0f + err * 0.002f);
-		float lo = BASE_RATE * (1.0f - RATE_TRIM);
-		float hi = BASE_RATE * (1.0f + RATE_TRIM);
+		float want = BASE_RATE * spd_est * (1.0f + err * 0.002f);
+		float lo = BASE_RATE * rate_floor;
+		float hi = BASE_RATE * 1.02f;
+		float d, lim;
 		if (want < lo) want = lo;
 		if (want > hi) want = hi;
-		/* slew so the pitch never steps audibly */
-		cur_rate += (want - cur_rate) * 0.05f;
+		d = want - cur_rate;
+		lim = cur_rate * 0.004f; /* <=0.4%/feed ~ 4 semitones/s: no click */
+		if (d > 0.0f) {
+			/* near-full queue is the mirror emergency of the empty
+			 * one: rising too slowly overflows NBUF and DROPS whole
+			 * feeds -- an audible skip, the very thing this exists
+			 * to kill (measured over=4/s at spd 68% with the timid
+			 * 0.2%/feed rise). */
+			float rise = (q >= NBUF - 2) ? cur_rate * 0.02f
+						     : lim * 0.5f;
+			if (d > rise)
+				d = rise;
+		} else {
+			float fall = (q <= 1) ? cur_rate * 0.02f : lim;
+			if (-d > fall)
+				d = -fall;
+		}
+		cur_rate += d;
 		ndspChnSetRate(NDSP_CHN, cur_rate);
 		snd3ds_rate = cur_rate;
 		snd3ds_queued = q;
 		snd3ds_target = target_queue;
 	}
+	ring_note(frames, q, evflags);
 }
 
 void out_register_ndsp3ds(struct out_driver *drv)
