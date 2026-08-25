@@ -66,8 +66,13 @@ sthread_t *pcsxr_sthread_create(void (*thread_func)(void *),
 		break;
 	case PCSXRT_DRC:
 		stack_size = new_dynarec_estimate_stack_size();
-		// fallthrough
+		core_id = is_new_3ds ? 2 : 1;
+		break;
 	case PCSXRT_GPU:
+		/* the 2026-08-25 intro crash dump showed a getreent TLS panic
+		 * with the PicaStation render chain on this thread's stack;
+		 * 128K buys margin for the deep flush/sync/convert nesting */
+		stack_size = 128 * 1024;
 		core_id = is_new_3ds ? 2 : 1;
 		break;
 	case PCSXRT_COUNT:
