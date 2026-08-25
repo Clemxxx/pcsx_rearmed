@@ -562,6 +562,19 @@ void mdec0Interrupt()
 #define SIZE_OF_24B_BLOCK (16*16*3)
 #define SIZE_OF_16B_BLOCK (16*16*2)
 
+/* wall-clock spent decoding (rl2blk+idct+yuv2rgb), for the 3DS frontend's
+ * perf line: sizes the MDEC worker-thread/SIMD work before building it */
+long long mdec_busy_ticks;
+#ifdef _3DS
+#include <3ds/types.h>
+#include <3ds/svc.h>
+#define MDEC_PROF_T0() u64 mdec_t0_ = svcGetSystemTick()
+#define MDEC_PROF_T1() (mdec_busy_ticks += (long long)(svcGetSystemTick() - mdec_t0_))
+#else
+#define MDEC_PROF_T0() do {} while (0)
+#define MDEC_PROF_T1() do {} while (0)
+#endif
+
 void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 	u32 words, words_max = 0;
 	int blk[DSIZE2 * 6];
@@ -594,6 +607,7 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 		return;
 	}
 
+	MDEC_PROF_T0();
 	if (mdec.reg0 & MDEC0_RGB24) {
 		/* 16 bits decoding
 		 * block are 16 px * 16 px, each px are 2 byte
@@ -654,7 +668,8 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 	}
 	if (size < 0)
 		log_unhandled("mdec: bork\n");
-	
+	MDEC_PROF_T1();
+
 	/* define the power of mdec */
 	set_event(PSXINT_MDECOUTDMA, words * MDEC_BIAS + MDEC_DELAY);
 	/* some CPU stalling */
