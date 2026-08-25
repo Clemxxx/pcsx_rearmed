@@ -61,6 +61,11 @@ sthread_t *pcsxr_sthread_create(void (*thread_func)(void *),
 
 	switch (type) {
 	case PCSXRT_CDR:
+		/* core 1 admits exactly ONE app thread and the SPU worker
+		 * claims it; the prefetch thread mostly sleeps on FS anyway,
+		 * so on N3DS park it on core 2 out of the SPU's way */
+		core_id = is_new_3ds ? 2 : 1;
+		break;
 	case PCSXRT_SPU:
 		core_id = 1;
 		break;
@@ -80,11 +85,14 @@ sthread_t *pcsxr_sthread_create(void (*thread_func)(void *),
 	}
 
 	ctr_thread = threadCreate(thread_func, NULL, stack_size, prio, core_id, false);
-	if (!ctr_thread) {
-		if (core_id == 1) {
-			SysPrintf("threadCreate pcsxt %d core %d failed\n",
-				type, core_id);
-			core_id = is_new_3ds ? 2 : -1;
+	if (!ctr_thread && core_id >= 1) {
+		SysPrintf("threadCreate pcsxt %d core %d failed\n",
+			type, core_id);
+		core_id = (core_id == 1 && is_new_3ds) ? 2 : -1;
+		ctr_thread = threadCreate(thread_func, NULL, stack_size,
+			prio, core_id, false);
+		if (!ctr_thread && core_id == 2) {
+			core_id = -1;
 			ctr_thread = threadCreate(thread_func, NULL, stack_size,
 				prio, core_id, false);
 		}
