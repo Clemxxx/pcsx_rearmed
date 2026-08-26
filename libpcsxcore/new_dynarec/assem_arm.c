@@ -1946,6 +1946,15 @@ static void inline_writestub(enum stub_type type, int i, u_int addr,
 
 /* Special assem */
 
+#ifdef GTE_PROF
+/* PicaStation gteprof.on: per-op GTE timing. gteprof_active is read
+ * from the flag file at boot, before the first block compiles —
+ * blocks emitted while it is 0 carry no hooks (zero cost). */
+extern int gteprof_active;
+extern void gteprof_start(int op);
+extern void gteprof_end(int op);
+#endif
+
 static void c2op_prologue(struct compile_state *st, u_int op, int i,
   const struct regstat *i_regs, u_int reglist)
 {
@@ -1955,6 +1964,12 @@ static void c2op_prologue(struct compile_state *st, u_int op, int i,
   emit_movimm(op, 0);
   emit_far_call(pcnt_gte_start);
 #endif
+#ifdef GTE_PROF
+  if (gteprof_active) {
+    emit_movimm(op, 0);
+    emit_far_call(gteprof_start);
+  }
+#endif
   emit_addimm(FP, (u_char *)&psxRegs.CP2D.r[0] - (u_char *)&dynarec_local, 0); // cop2 regs
 }
 
@@ -1963,6 +1978,12 @@ static void c2op_epilogue(u_int op,u_int reglist)
 #ifdef PCNT
   emit_movimm(op,0);
   emit_far_call(pcnt_gte_end);
+#endif
+#ifdef GTE_PROF
+  if (gteprof_active) {
+    emit_movimm(op, 0);
+    emit_far_call(gteprof_end);
+  }
 #endif
   restore_regs_all(reglist);
 }

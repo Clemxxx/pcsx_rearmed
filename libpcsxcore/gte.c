@@ -1764,7 +1764,11 @@ int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
 	return 1;
 }
 
-void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
+/* notefull.on: route pgxp_note through the pre-slim path below
+ * (kept verbatim) instead of the deduplicated one */
+int pgxp_note_full;
+
+static void pgxp_note_v1(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
                s32 vx, s32 vy, s32 vz, s32 ofx, s32 ofy, s32 h, int slot)
 {
 	u32 key = pgxp_key((u32)sx, (u32)sy);
@@ -1877,6 +1881,81 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 	 * objects (different FOV for a weapon model, a cutscene camera,
 	 * a UI layer), and a single global left every consumer using
 	 * whichever values happened to be written last that frame. */
+	e->ofx = (float)ofx / 65536.0f;
+	e->ofy = (float)ofy / 65536.0f;
+	e->h = (float)h;
+	pgxp_writes++;
+}
+
+/* Deduplicated pgxp_note: identical values to _v1 in every consumer —
+ * one set of converts+clamps now serves the truth stream, the pool
+ * append AND the hash entry. _v1 computed the clamped position twice
+ * and filled a whole pgxp_ent even when the pool (address provenance)
+ * was off, which made it ~2x its useful cost per vertex in the
+ * shipping config. Semantics notes carried over from _v1: saturate
+ * like the hardware (limG1/limG2 to [-1024,1023], depth floored at
+ * H/2); RTPS fills FIFO slot 3 (push), RTPT slots 0..2 directly;
+ * ambiguity poisoning uses a relative depth tolerance. */
+void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
+               s32 vx, s32 vy, s32 vz, s32 ofx, s32 ofy, s32 h, int slot)
+{
+	u32 key;
+	pgxp_ent *e;
+	float z, px, py;
+
+	if (pgxp_note_full) {
+		pgxp_note_v1(fx, fy, sx, sy, sz, vx, vy, vz, ofx, ofy, h,
+			     slot);
+		return;
+	}
+	key = pgxp_key((u32)sx, (u32)sy);
+	e = &pgxp_tab[pgxp_slot(key)];
+	z = (float)sz;
+	px = (float)fx / 65536.0f;
+	py = (float)fy / 65536.0f;
+	if (px < -1024.0f) px = -1024.0f;
+	if (px > 1023.0f) px = 1023.0f;
+	if (py < -1024.0f) py = -1024.0f;
+	if (py > 1023.0f) py = 1023.0f;
+	if (z < (float)h * 0.5f) z = (float)h * 0.5f;
+	pgxp_truth_note(px, py, z);
+	if (pgxp_pool) {
+		u32 seq = pgxp_pool_head++;
+		pgxp_xf *xf = &pgxp_pool[seq & (PGXP_POOL_N - 1)];
+		xf->epoch = pgxp_epoch;
+		xf->x = px;   xf->y = py;   xf->z = z;
+		xf->vx = (float)vx; xf->vy = (float)vy; xf->vz = (float)vz;
+		xf->ofx = (float)ofx / 65536.0f;
+		xf->ofy = (float)ofy / 65536.0f;
+		xf->h = (float)h;
+		if (slot == 3) {
+			pgxp_fifo_seq[0] = pgxp_fifo_seq[1];
+			pgxp_fifo_seq[1] = pgxp_fifo_seq[2];
+			pgxp_fifo_seq[2] = seq;
+		} else if (slot >= 0 && slot < 3) {
+			pgxp_fifo_seq[slot] = seq;
+		}
+	}
+	if (e->key == key && e->epoch == pgxp_epoch) {
+		float d = e->z - z, lim = z * 0.02f;
+		if (d < 0) d = -d;
+		if (lim < 2.0f) lim = 2.0f;
+		if (d > lim) {
+			e->amb = 1;
+			pgxp_amb++;
+			return;
+		}
+	} else {
+		e->amb = 0;
+	}
+	e->key = key;
+	e->x = px;
+	e->y = py;
+	e->z = z;                      /* view depth, GTE units */
+	e->vx = (float)vx;             /* view space, same units as z */
+	e->vy = (float)vy;
+	e->vz = (float)vz;
+	e->epoch = pgxp_epoch;
 	e->ofx = (float)ofx / 65536.0f;
 	e->ofy = (float)ofy / 65536.0f;
 	e->h = (float)h;

@@ -70,8 +70,11 @@ sthread_t *pcsxr_sthread_create(void (*thread_func)(void *),
 		core_id = 1;
 		break;
 	case PCSXRT_DRC:
+		/* core 2 hosts the render thread now; the compile worker gets
+		 * core 3 (Luma hb:ldr grants it on N3DS — the boot probe logs
+		 * it). Fallback chain below lands on core 2 then default. */
 		stack_size = new_dynarec_estimate_stack_size();
-		core_id = is_new_3ds ? 2 : 1;
+		core_id = is_new_3ds ? 3 : 1;
 		break;
 	case PCSXRT_GPU:
 		/* the 2026-08-25 intro crash dump showed a getreent TLS panic
@@ -88,7 +91,7 @@ sthread_t *pcsxr_sthread_create(void (*thread_func)(void *),
 	if (!ctr_thread && core_id >= 1) {
 		SysPrintf("threadCreate pcsxt %d core %d failed\n",
 			type, core_id);
-		core_id = (core_id == 1 && is_new_3ds) ? 2 : -1;
+		core_id = (core_id != 2 && is_new_3ds) ? 2 : -1;
 		ctr_thread = threadCreate(thread_func, NULL, stack_size,
 			prio, core_id, false);
 		if (!ctr_thread && core_id == 2) {
