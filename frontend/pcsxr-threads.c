@@ -35,11 +35,15 @@ static void pcsxr_sthread_lib_init(void)
 	/* Core 1 is the SYSTEM core: app threads there run inside this
 	 * time slice. 35% strangled PicaStation's core-1 repair stage to
 	 * a third of the core (measured: 40us wall per prim record vs
-	 * ~13us of CPU). N3DS tolerates 80 — the sysmodules keep 20% and
-	 * networking stays healthy; o3DS keeps the conservative 35. */
+	 * ~13us of CPU). 80% correlated with qtm asserts on real hardware
+	 * (three crashes, including one with NO app thread on core 3 —
+	 * the 20% system leftover was apparently too thin for the
+	 * sysmodules). 60 keeps the repair stage fed while leaving the
+	 * OS 40%; the conv worker's queue-full inline fallback absorbs
+	 * whatever the slice can't. o3DS keeps the conservative 35. */
 	APT_SetAppCpuTimeLimit(35);
 	if (is_new_3ds)
-		APT_SetAppCpuTimeLimit(80);
+		APT_SetAppCpuTimeLimit(60);
 	u32 percent = -1;
 	APT_GetAppCpuTimeLimit(&percent);
 
