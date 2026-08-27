@@ -84,6 +84,11 @@ void irq_test(psxCP0Regs *cp0)
 		psxException(0, 0, cp0);
 }
 
+/* PicaStation emuprof: section stamp read by the frontend's sampler
+ * thread. gen_interupt is the dynarec's only cycle-exhaust callback,
+ * so tag 2 covers all event dispatch (cdrom/timers/dma/spu/mdec). */
+extern volatile int emuprof_tag;
+
 void gen_interupt(psxCP0Regs *cp0)
 {
 	psxRegisters *regs = cp0TOpsxRegs(cp0);
@@ -91,8 +96,10 @@ void gen_interupt(psxCP0Regs *cp0)
 	evprintf("  +ge %08x, %u->%u (%d)\n", regs->pc, regs->cycle,
 		regs->next_interupt, regs->next_interupt - regs->cycle);
 
+	emuprof_tag = 2;
 	irq_test(cp0);
 	schedule_timeslice(regs);
+	emuprof_tag = 0;
 
 	evprintf("  -ge %08x, %u->%u (%d)\n", regs->pc, regs->cycle,
 		regs->next_interupt, regs->next_interupt - regs->cycle);
