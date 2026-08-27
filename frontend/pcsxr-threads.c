@@ -74,8 +74,15 @@ sthread_t *pcsxr_sthread_create(void (*thread_func)(void *),
 	case PCSXRT_CDR:
 		/* core 1 admits exactly ONE app thread and the SPU worker
 		 * claims it; the prefetch thread mostly sleeps on FS anyway,
-		 * so on N3DS park it on core 2 out of the SPU's way */
+		 * so on N3DS park it on core 2 out of the SPU's way.
+		 * PRIORITY ABOVE the render thread (0x30) sharing core 2:
+		 * at 0x31 it starved once the renderer got busy, every CDDA
+		 * music sector missed the cache, and the emu thread paid
+		 * ~2.3ms of synchronous SD latency 64 times a second
+		 * (measured: cdread=1.5s/10s of the evt bucket). It only
+		 * needs the CPU for microseconds around each FS IPC. */
 		core_id = is_new_3ds ? 2 : 1;
+		prio -= 2;
 		break;
 	case PCSXRT_SPU:
 		core_id = 1;

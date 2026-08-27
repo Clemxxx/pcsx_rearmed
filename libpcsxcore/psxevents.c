@@ -61,6 +61,13 @@ static irq_func * const irq_funcs[] = {
 	[PSXINT_RCNT] = psxRcntUpdate,
 };
 
+/* PicaStation event profile: which irq eats the emuprof evt bucket
+ * (measured 12-18% of the emu thread at the 85% ceiling). Drained by
+ * the frontend heartbeat. 3DS-only tick source. */
+u64 evtp_ticks[32];
+u32 evtp_n[32];
+extern u64 svcGetSystemTick(void);
+
 void irq_test(psxCP0Regs *cp0)
 {
 	psxRegisters *regs = cp0TOpsxRegs(cp0);
@@ -68,12 +75,16 @@ void irq_test(psxCP0Regs *cp0)
 	u32 irq, irq_bits;
 
 	for (irq = 0, irq_bits = regs->interrupt; irq_bits != 0; irq++, irq_bits >>= 1) {
+		u64 t0;
 		if (!(irq_bits & 1))
 			continue;
 		if ((s32)(cycle - regs->event_cycles[irq]) >= 0) {
 			// note: irq_funcs() also modify regs->interrupt
 			regs->interrupt &= ~(1u << irq);
+			t0 = svcGetSystemTick();
 			irq_funcs[irq]();
+			evtp_ticks[irq & 31] += svcGetSystemTick() - t0;
+			evtp_n[irq & 31]++;
 		}
 	}
 
