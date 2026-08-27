@@ -1703,8 +1703,13 @@ int pgxp_mem_set(int on)
 	pgxp_mem_on = on;
 	return 1;
 }
+/* PicaStation emuprof: tag 8 = time inside PGXP display-list lookups,
+ * so the emu profile can say whether the 3D recovery costs anything.
+ * The frontend defines the tag; this file only stamps it. */
+extern volatile int emuprof_tag;
+
 /* exact match by address: no collisions, no ambiguity, no guessing */
-int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
+static int pgxp_addr_lookup_(u32 addr, u32 val, float *x, float *y, float *z,
                      float *vx, float *vy, float *vz,
                      float *ofx, float *ofy, float *h)
 {
@@ -1762,6 +1767,17 @@ int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
 	*ofx = e->ofx; *ofy = e->ofy; *h = e->h;
 	pgxp_addr_hit++;
 	return 1;
+}
+
+int pgxp_addr_lookup(u32 addr, u32 val, float *x, float *y, float *z,
+                     float *vx, float *vy, float *vz,
+                     float *ofx, float *ofy, float *h)
+{
+	int prev = emuprof_tag, r;
+	emuprof_tag = 8;
+	r = pgxp_addr_lookup_(addr, val, x, y, z, vx, vy, vz, ofx, ofy, h);
+	emuprof_tag = prev;
+	return r;
 }
 
 /* notefull.on: route pgxp_note through the pre-slim path below
@@ -1988,7 +2004,7 @@ int pgxp_lookup_v(u32 packed, float *vx, float *vy, float *vz)
 	return 1;
 }
 
-int pgxp_lookup(u32 packed, float *x, float *y, float *z)
+static int pgxp_lookup_(u32 packed, float *x, float *y, float *z)
 {
 	/* The 11-bit mask is NOT cosmetic: some games pack extra data into
 	 * the top bits of a vertex word (THPS is the documented case), so
@@ -2023,6 +2039,15 @@ int pgxp_lookup(u32 packed, float *x, float *y, float *z)
 	}
 	*x = e->x; *y = e->y; *z = e->z;
 	return 1;
+}
+
+int pgxp_lookup(u32 packed, float *x, float *y, float *z)
+{
+	int prev = emuprof_tag, r;
+	emuprof_tag = 8;
+	r = pgxp_lookup_(packed, x, y, z);
+	emuprof_tag = prev;
+	return r;
 }
 
 void gteDispatch(psxCP2Regs *regs, u32 code)
