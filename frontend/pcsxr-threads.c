@@ -32,7 +32,14 @@ static void pcsxr_sthread_lib_init(void)
 	APT_CheckNew3DS(&is_new_3ds);
 	svcGetSystemInfo(&version, 0x10000, 0);
 
+	/* Core 1 is the SYSTEM core: app threads there run inside this
+	 * time slice. 35% strangled PicaStation's core-1 repair stage to
+	 * a third of the core (measured: 40us wall per prim record vs
+	 * ~13us of CPU). N3DS tolerates 80 — the sysmodules keep 20% and
+	 * networking stays healthy; o3DS keeps the conservative 35. */
 	APT_SetAppCpuTimeLimit(35);
+	if (is_new_3ds)
+		APT_SetAppCpuTimeLimit(80);
 	u32 percent = -1;
 	APT_GetAppCpuTimeLimit(&percent);
 
@@ -70,11 +77,14 @@ sthread_t *pcsxr_sthread_create(void (*thread_func)(void *),
 		core_id = 1;
 		break;
 	case PCSXRT_DRC:
-		/* core 2 hosts the render thread now; the compile worker gets
-		 * core 3 (Luma hb:ldr grants it on N3DS — the boot probe logs
-		 * it). Fallback chain below lands on core 2 then default. */
+		/* NEVER core 3: qtm (N3DS head tracking) lives there and app
+		 * threads starve it until it asserts — two hardware crashes
+		 * (Luma dumps 6 & 7, identical qtm PC) with busy app threads
+		 * on core 3; the compile thread was tolerated only while the
+		 * emu ran slow enough to keep it idle. Core 2 absorbs the
+		 * transient compile bursts alongside the render thread. */
 		stack_size = new_dynarec_estimate_stack_size();
-		core_id = is_new_3ds ? 3 : 1;
+		core_id = is_new_3ds ? 2 : 1;
 		break;
 	case PCSXRT_GPU:
 		/* the 2026-08-25 intro crash dump showed a getreent TLS panic
