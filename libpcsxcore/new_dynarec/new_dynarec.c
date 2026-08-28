@@ -709,8 +709,13 @@ void new_dyna_clear_cache(void *start, void *end)
   #elif defined(VITA)
   sceKernelSyncVMDomain(sceBlock, start, len);
   #elif defined(_3DS)
-  // tuned for old3ds' 16k:16k cache (in it's mostly clean state...)
-  if ((char *)end - (char *)start <= 2*1024)
+  // upstream used a 2KB cutoff "tuned for old3ds' 16k:16k cache"; the
+  // real cost of the full flush is not the op but the cold L1I+BTB
+  // afterward, and N3DS refills through its 2MB L2. Ranged clean +
+  // invalidate by MVA is ~2 cp15 ops per 32B line, so even 64KB is
+  // only ~4k ops with interrupts off -- still cheaper than resuming
+  // the emu core stone-cold.
+  if ((char *)end - (char *)start <= 64*1024)
     ctr_clear_cache_range(start, end);
   else
     ctr_clear_cache();
@@ -740,10 +745,34 @@ static void start_tcache_write(void *start, void *end)
 static void end_tcache_write(void *start, void *end, int clear_cache)
 {
 #ifdef NDRC_THREAD
+  while (__sync_lock_test_and_set(&ndrc_g.thread.dirty_slock, 1))
+    ;
   if (!ndrc_g.thread.dirty_start || (size_t)ndrc_g.thread.dirty_start > (size_t)start)
     ndrc_g.thread.dirty_start = start;
   if ((size_t)ndrc_g.thread.dirty_end < (size_t)end)
     ndrc_g.thread.dirty_end = end;
+  if (ndrc_g.thread.dirty_n >= 0) {
+    // merge into the last span when adjacent (consecutive block
+    // compiles at `out` collapse into one range); page-align the
+    // adjacency test so link patches in one page merge too
+    int n = ndrc_g.thread.dirty_n;
+    if (n > 0
+        && (size_t)start <= ((size_t)ndrc_g.thread.dirty_r[n-1].e | 4095) + 1
+        && (size_t)end >= (size_t)ndrc_g.thread.dirty_r[n-1].s) {
+      if ((size_t)start < (size_t)ndrc_g.thread.dirty_r[n-1].s)
+        ndrc_g.thread.dirty_r[n-1].s = start;
+      if ((size_t)end > (size_t)ndrc_g.thread.dirty_r[n-1].e)
+        ndrc_g.thread.dirty_r[n-1].e = end;
+    }
+    else if (n < NDRC_DIRTY_RANGES) {
+      ndrc_g.thread.dirty_r[n].s = start;
+      ndrc_g.thread.dirty_r[n].e = end;
+      ndrc_g.thread.dirty_n = n + 1;
+    }
+    else
+      ndrc_g.thread.dirty_n = -1; // overflow: union takes over
+  }
+  __sync_lock_release(&ndrc_g.thread.dirty_slock);
 #endif
   if (clear_cache)
     new_dyna_clear_cache(start, end);

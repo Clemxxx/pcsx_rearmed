@@ -21,6 +21,8 @@
 #if defined(HAVE_LIBNX)
 #define TC_WRITE_OFFSET 1
 #endif
-#if defined(_3DS)
-#define NDRC_CACHE_FLUSH_ALL 1
-#endif
+// 3DS: was NDRC_CACHE_FLUSH_ALL (any patch = whole-TC dirty = entire
+// L1I+BTB wipe on the emu core at its next sync). With the ranged
+// kernel flush (ctr_clear_cache_range) + the raised range cutoff in
+// new_dyna_clear_cache + the dirty-span list consumed by
+// clear_local_cache, the per-page path is strictly cheaper on N3DS.

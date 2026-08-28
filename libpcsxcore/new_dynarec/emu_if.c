@@ -323,15 +323,37 @@ static void clear_local_cache(void)
 		// the actual clean/invalidate is broadcast to all cores,
 		// the manual only prescribes an isb
 		__asm__ volatile("isb");
-//#elif defined(_3DS)
-//		ctr_invalidate_icache();
+		ndrc_g.thread.dirty_start = ndrc_g.thread.dirty_end = 0;
 #else
 		// while on v6 this is always required, on v7 it depends on
 		// "Multiprocessing Extensions" being present, but that is difficult
-		// to detect so do it always for now
-		new_dyna_clear_cache(ndrc_g.thread.dirty_start, ndrc_g.thread.dirty_end);
-#endif
+		// to detect so do it always for now.
+		// Snapshot + clear the dirty spans under the lock, flush after
+		// releasing it: the per-span ranged flush beats one flush of the
+		// min/max union, which one far link patch inflates to a span the
+		// platform backend can only serve with a full-cache flush.
+		struct { void *s, *e; } r[NDRC_DIRTY_RANGES];
+		void *us, *ue;
+		int i, n;
+		while (__sync_lock_test_and_set(&ndrc_g.thread.dirty_slock, 1))
+			;
+		n = ndrc_g.thread.dirty_n;
+		for (i = 0; i < n; i++) {
+			r[i].s = ndrc_g.thread.dirty_r[i].s;
+			r[i].e = ndrc_g.thread.dirty_r[i].e;
+		}
+		us = ndrc_g.thread.dirty_start;
+		ue = ndrc_g.thread.dirty_end;
 		ndrc_g.thread.dirty_start = ndrc_g.thread.dirty_end = 0;
+		ndrc_g.thread.dirty_n = 0;
+		__sync_lock_release(&ndrc_g.thread.dirty_slock);
+		if (n >= 0) {
+			for (i = 0; i < n; i++)
+				new_dyna_clear_cache(r[i].s, r[i].e);
+		}
+		else
+			new_dyna_clear_cache(us, ue);
+#endif
 	}
 #endif
 }

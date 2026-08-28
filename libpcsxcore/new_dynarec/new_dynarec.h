@@ -24,6 +24,15 @@ struct ndrc_globals
 		void *cond;
 		void *dirty_start;
 		void *dirty_end;
+		// bounded list of dirty TC spans so the executing core can do
+		// ranged icache maintenance instead of flushing the min/max
+		// union above (one far link patch makes that union span MBs =
+		// full-cache flush). The union stays authoritative: overflow
+		// (dirty_n < 0) falls back to it. dirty_slock guards both.
+#define NDRC_DIRTY_RANGES 8
+		struct { void *s, *e; } dirty_r[NDRC_DIRTY_RANGES];
+		int dirty_n; // < 0 = overflowed, use dirty_start/dirty_end
+		volatile int dirty_slock;
 		unsigned int busy_addr; // 0 is valid, ~0 == none
 		int exit;
 	} thread;
