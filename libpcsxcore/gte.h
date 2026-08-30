@@ -81,6 +81,7 @@ void pgxp_frame(void);   /* call once per emulated frame */
 /* register-file capture after the asm fast paths (see gte.c); the
  * recompiler emits calls to these when pgxp_asmcap_off is clear */
 extern int pgxp_asmcap_off;
+extern int pgxp_keep_vecs;
 void pgxp_note_rtps_regs(struct psxCP2Regs *regs);
 void pgxp_note_rtpt_regs(struct psxCP2Regs *regs);
 gte_handler *gteGetHandler(u32 code);

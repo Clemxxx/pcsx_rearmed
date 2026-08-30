@@ -1968,9 +1968,11 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 	e->x = px;
 	e->y = py;
 	e->z = z;                      /* view depth, GTE units */
-	e->vx = (float)vx;             /* view space, same units as z */
-	e->vy = (float)vy;
-	e->vz = (float)vz;
+	if (pgxp_keep_vecs) {          /* orbit-only data (see above) */
+		e->vx = (float)vx;
+		e->vy = (float)vy;
+		e->vz = (float)vz;
+	}
 	e->epoch = pgxp_epoch;
 	e->ofx = (float)ofx / 65536.0f;
 	e->ofy = (float)ofy / 65536.0f;
@@ -1990,6 +1992,12 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
  * carry, which makes the correlation gate exact by construction.
  * asmcap.off restores the old C-handler fallback. */
 int pgxp_asmcap_off;
+/* keep the per-vertex view vectors in the capture table. They feed
+ * only the orbit diagnostic (which itself re-projects from
+ * screen+depth and reads them for logging) — production stereo never
+ * looks at them, so the stores are skipped unless the orbit flag was
+ * present at boot (gpu_plugin sets this). */
+int pgxp_keep_vecs;
 
 void pgxp_note_rtps_regs(psxCP2Regs *regs)
 {
