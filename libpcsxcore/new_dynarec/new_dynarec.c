@@ -35,6 +35,11 @@
 long long ndrc3ds_compile_ticks;
 int ndrc3ds_compile_calls;
 #endif
+/* PicaStation, referenced from the shared codegen below:
+ * count of compiled load/store sites speculated as scratchpad, and the
+ * scratch.off kill switch for the inline scratchpad fast path. */
+int ndrc3ds_scratch_sites;
+int scratch_fastpath_off;
 #ifdef HAVE_LIBNX
 #include <switch.h>
 static Jit g_jit;
@@ -3243,6 +3248,7 @@ static void *emit_fastpath_cmp_jump(struct compile_state *st, int i,
     type=0;
   }
   else if(type==MTYPE_1F80) { // scratchpad
+    ndrc3ds_scratch_sites++;
     if (psxRegs.ptrs.psxH == (void *)0x1f800000) {
       host_tempreg_acquire();
       emit_xorimm(addr,0x1f800000,HOST_TEMPREG);
@@ -3250,6 +3256,21 @@ static void *emit_fastpath_cmp_jump(struct compile_state *st, int i,
       host_tempreg_release();
       jaddr=out;
       emit_jc(0);
+    }
+    else if (!scratch_fastpath_off) {
+      /* Without mmap (3DS) psxH is calloc'd, so the identity fast path
+       * above can never fire and every scratchpad access fell through
+       * to the RAM check -> slow stub. Keep it inline instead: the xor
+       * leaves the in-page offset, then fold in the host base. psxH is
+       * allocated once in psxMemInit and only freed at shutdown, so the
+       * baked pointer cannot go stale within a session. */
+      host_tempreg_acquire();
+      emit_xorimm(addr,0x1f800000,HOST_TEMPREG);
+      emit_cmpimm(HOST_TEMPREG,0x1000);
+      jaddr=out;
+      emit_jc(0);
+      emit_addimm(HOST_TEMPREG,(u_int)(uintptr_t)psxRegs.ptrs.psxH,HOST_TEMPREG);
+      addr=*addr_reg_override=HOST_TEMPREG; // caller releases the tempreg
     }
     else {
       // do the usual RAM check, jump will go to the right handler

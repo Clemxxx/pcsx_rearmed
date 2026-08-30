@@ -1,5 +1,7 @@
 
-#ifdef __arm__
+// 3DS (ARM11/MPCore): the A8 workaround only costs here — alignment
+// nops, a forced r7 move on every jr, inverted backward branches.
+#if defined(__arm__) && !defined(ARM11)
 #define CORTEX_A8_BRANCH_PREDICTION_HACK 1
 #endif
 
