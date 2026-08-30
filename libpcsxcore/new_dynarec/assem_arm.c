@@ -2032,6 +2032,7 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
   u_int reglist = reglist_full & CALLER_SAVE_REGS;
   int need_flags = !(gte_unneeded[i+1] >> 63); // +1 because of how liveness detection works
   gte_handler *handler;
+  void *post_handler = NULL;  /* reg-file capture after an asm op */
 
   if (HACK_ENABLED(NDHACK_GTE_NO_FLAGS))
     need_flags = 0;
@@ -2094,6 +2095,14 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
           handler = need_flags ? gteRTPS_sf1lm0_arm : gteRTPS_sf1lm0_nf_arm;
 #endif
         }
+#if !defined(__ARM_NEON__) && defined(HAVE_ARMV5)
+        else if (shift && !lm && !gte_tag_on && !pgxp_asmcap_off) {
+          /* capture ON: keep the asm fast path and capture from the
+           * register file AFTER the op (see pgxp_note_rtps_regs) */
+          handler = need_flags ? gteRTPS_sf1lm0_arm : gteRTPS_sf1lm0_nf_arm;
+          post_handler = pgxp_note_rtps_regs;
+        }
+#endif
         goto do_handler;
       case GTEOP_RTPT:
         if (shift && !lm && !pgxp_capture_on && !gte_tag_on) {
@@ -2103,6 +2112,12 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
           handler = need_flags ? gteRTPT_sf1lm0_arm : gteRTPT_sf1lm0_nf_arm;
 #endif
         }
+#if !defined(__ARM_NEON__) && defined(HAVE_ARMV5)
+        else if (shift && !lm && !gte_tag_on && !pgxp_asmcap_off) {
+          handler = need_flags ? gteRTPT_sf1lm0_arm : gteRTPT_sf1lm0_nf_arm;
+          post_handler = pgxp_note_rtpt_regs;
+        }
+#endif
         goto do_handler;
       case GTEOP_NCLIP:
         /* the asm NCLIP reads the raw SXY registers, which carry the
@@ -2150,6 +2165,12 @@ static void c2op_assemble(struct compile_state *st, int i, const struct regstat 
         emit_movimm(st->source[i],1); // opcode
         //emit_writeword(1,&psxRegs.code);
         emit_far_call(handler);
+        if (post_handler) {
+          /* r0 was clobbered by the handler: reload the CP2 regs
+           * pointer (same pattern as the MACtoIR calls above) */
+          emit_addimm(FP, (char *)&psxRegs.CP2D.r[0] - (char *)&dynarec_local, 0);
+          emit_far_call(post_handler);
+        }
         break;
     }
     c2op_epilogue(c2op, reglist);

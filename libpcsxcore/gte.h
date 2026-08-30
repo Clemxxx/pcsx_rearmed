@@ -78,6 +78,11 @@ int pgxp_lookup_v(u32 packed, float *vx, float *vy, float *vz);
 /* the projection parameters that vertex was transformed with */
 int pgxp_lookup_proj(u32 packed, float *ofx, float *ofy, float *h);
 void pgxp_frame(void);   /* call once per emulated frame */
+/* register-file capture after the asm fast paths (see gte.c); the
+ * recompiler emits calls to these when pgxp_asmcap_off is clear */
+extern int pgxp_asmcap_off;
+void pgxp_note_rtps_regs(struct psxCP2Regs *regs);
+void pgxp_note_rtpt_regs(struct psxCP2Regs *regs);
 gte_handler *gteGetHandler(u32 code);
 gte_handler *gteGetHandler_nf(u32 code);
 

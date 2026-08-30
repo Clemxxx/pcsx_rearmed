@@ -1978,6 +1978,47 @@ void pgxp_note(s64 fx, s64 fy, s32 sx, s32 sy, s32 sz,
 	pgxp_writes++;
 }
 
+/* ---- capture from the REGISTER FILE, after an asm fast-path op ----
+ * With capture on, RTPS/RTPT used to fall back to the C handlers just
+ * to keep the sub-pixel projection and per-vertex view vectors. Both
+ * were audited diagnostic-only: the shipping stereo consumes only the
+ * DEPTH, and orbit re-projects from screen+depth by design (the
+ * captured IR vectors are deliberately never used). Everything else
+ * capture needs survives the op in the register file — so the dynarec
+ * now keeps the hand-scheduled asm handler and emits one call to
+ * these afterwards. px/py capture as the integer SXY the packet will
+ * carry, which makes the correlation gate exact by construction.
+ * asmcap.off restores the old C-handler fallback. */
+int pgxp_asmcap_off;
+
+void pgxp_note_rtps_regs(psxCP2Regs *regs)
+{
+	u32 sxy = regs->CP2D.r[14];              /* SXY2 (just pushed) */
+	s32 sx = (s32)(s16)(sxy & 0xffff), sy = (s32)sxy >> 16;
+	s32 sz = (s32)(u16)regs->CP2D.r[19];     /* SZ3 */
+	pgxp_note((s64)sx << 16, (s64)sy << 16, sx, sy, sz,
+	          (s32)regs->CP2D.r[9], (s32)regs->CP2D.r[10], sz,
+	          (s32)regs->CP2C.r[24], (s32)regs->CP2C.r[25],
+	          (s32)(u16)regs->CP2C.r[26], 3); /* RTPS: FIFO push */
+}
+
+void pgxp_note_rtpt_regs(psxCP2Regs *regs)
+{
+	int v;
+	for (v = 0; v < 3; v++) {
+		u32 sxy = regs->CP2D.r[12 + v];      /* SXY0..2 */
+		s32 sx = (s32)(s16)(sxy & 0xffff), sy = (s32)sxy >> 16;
+		s32 sz = (s32)(u16)regs->CP2D.r[17 + v]; /* SZ1..3 */
+		/* IR1/IR2 hold only the LAST vertex's view vector; the
+		 * earlier ones are gone — pass zero (audited unused) */
+		pgxp_note((s64)sx << 16, (s64)sy << 16, sx, sy, sz,
+		          v == 2 ? (s32)regs->CP2D.r[9] : 0,
+		          v == 2 ? (s32)regs->CP2D.r[10] : 0, sz,
+		          (s32)regs->CP2C.r[24], (s32)regs->CP2C.r[25],
+		          (s32)(u16)regs->CP2C.r[26], v);
+	}
+}
+
 /* returns 1 and fills x/y/z when this packed XY was produced by a
  * transform we saw; 0 when it was not (2D art, CPU-built geometry) */
 int pgxp_lookup_proj(u32 packed, float *ofx, float *ofy, float *h)
