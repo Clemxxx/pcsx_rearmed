@@ -35,11 +35,12 @@
 long long ndrc3ds_compile_ticks;
 int ndrc3ds_compile_calls;
 #endif
-/* PicaStation, referenced from the shared codegen below:
- * count of compiled load/store sites speculated as scratchpad, and the
- * scratch.off kill switch for the inline scratchpad fast path. */
+/* PicaStation, referenced from the shared codegen below: count of
+ * compiled load/store sites speculated as scratchpad, and the scratch.on
+ * switch for the inline scratchpad fast path (measured: not a win, see
+ * emit_fastpath_cmp_jump). */
 int ndrc3ds_scratch_sites;
-int scratch_fastpath_off;
+int scratch_fastpath_on;
 #ifdef HAVE_LIBNX
 #include <switch.h>
 static Jit g_jit;
@@ -3257,13 +3258,20 @@ static void *emit_fastpath_cmp_jump(struct compile_state *st, int i,
       jaddr=out;
       emit_jc(0);
     }
-    else if (!scratch_fastpath_off) {
+    else if (scratch_fastpath_on) {
       /* Without mmap (3DS) psxH is calloc'd, so the identity fast path
-       * above can never fire and every scratchpad access fell through
-       * to the RAM check -> slow stub. Keep it inline instead: the xor
-       * leaves the in-page offset, then fold in the host base. psxH is
-       * allocated once in psxMemInit and only freed at shutdown, so the
-       * baked pointer cannot go stale within a session. */
+       * above can never fire and every scratchpad access falls through
+       * to the RAM check -> slow stub. This keeps it inline instead: the
+       * xor leaves the in-page offset, then fold in the host base. psxH
+       * is allocated once in psxMemInit and only freed at shutdown, so
+       * the baked pointer cannot go stale within a session.
+       *
+       * MEASURED ON HW (MGS dock, N3DS): a wash to slightly negative --
+       * spd 85-86 on vs 84-90 off, against 90-93 without it. ~820 sites
+       * compile this way but they are evidently cold, and the host base
+       * is not an ARM imm8 rotate, so each site pays a literal-pool load
+       * and the added code costs more I-cache than the stubs saved.
+       * Kept opt-in (scratch.on) for other games, off in production. */
       host_tempreg_acquire();
       emit_xorimm(addr,0x1f800000,HOST_TEMPREG);
       emit_cmpimm(HOST_TEMPREG,0x1000);
